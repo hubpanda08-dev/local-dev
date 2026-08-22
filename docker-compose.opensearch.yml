@@ -1,0 +1,98 @@
+# =============================================================================
+# Optional OpenSearch overlay — the storage side of the java-logging-sdk pipeline
+# (App → SDK → Kafka → OTel Collector → OpenSearch), for testing that logs emitted
+# by a running service (e.g. identity-service's @AuthLogged) actually land somewhere
+# visible end-to-end.
+#
+# Also the search/indexing cluster for the es-sync library (work-management's
+# onified.opensearch-sync, platform-data's onified.es-sync) — those index
+# business tables, unrelated to the log pipeline above.
+#
+# Reuses the Kafka broker already brought up by docker-compose.local.yml (same
+# compose project/network, so `kafka:29092` resolves) — does NOT start a second
+# Kafka. No longer an optional `-f` overlay: docker-compose.yml pulls this in
+# via `include:`, so a plain `docker compose -f deployment/docker-compose.yml
+# up -d` starts it with the rest of the infra.
+#
+# UIs once up:
+#   OpenSearch Dashboards   http://localhost:5601
+#   OpenSearch REST API     http://localhost:9210   (in-network: opensearch:9200)
+#
+# Verify a log landed (e.g. after an OTP login hits identity-service):
+#   curl http://localhost:9210/otel-logs-security_authentication/_search?pretty
+#
+# Security plugin is disabled, so there is no login and every caller has full
+# rights (create/delete any index) — set the es-sync api-key properties empty
+# locally. Index admin from the host:
+#   curl http://localhost:9210/_cat/indices?v
+#   curl -X DELETE http://localhost:9210/<index>
+#
+# Adapted from observability/observability/otel/docker-compose.yml +
+# otel-collector-config.yaml — S3 (awss3) exporters dropped for local use (no AWS
+# creds locally); everything else (all 19 SDK log-type Kafka topics → per-type
+# OpenSearch index) is unchanged. See otel-collector-logs/config.yaml.
+# =============================================================================
+
+services:
+  opensearch:
+    image: opensearchproject/opensearch:2.11.0
+    container_name: onified-opensearch
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      bootstrap.memory_lock: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+      DISABLE_SECURITY_PLUGIN: "true"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      # Host 9210, NOT 9200 — sidecar-secret-proxy maps host 9200 (see
+      # docker-compose.sidecar.yml) and cargo's SECRET_PROXY_BASE_URL points at
+      # host.docker.internal:9200, so that mapping can't move. Only host-side
+      # tools (curl, browser, a bootRun service on Windows) use 9210; every
+      # container still talks to opensearch:9200 over onified-network.
+      - "9210:9200"
+      - "9600:9600"
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9200/_cluster/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:2.11.0
+    container_name: onified-opensearch-dashboards
+    restart: unless-stopped
+    depends_on:
+      - opensearch
+    ports:
+      - "5601:5601"
+    environment:
+      OPENSEARCH_HOSTS: '["http://opensearch:9200"]'
+      DISABLE_SECURITY_DASHBOARDS_PLUGIN: "true"
+
+  # Separate from the `otel-collector` in docker-compose.local.yml (that one is
+  # OTLP-only, for traces/metrics from bootRun services). This one consumes the
+  # SDK's structured-log Kafka topics and writes them into OpenSearch.
+  otel-collector-logs:
+    image: otel/opentelemetry-collector-contrib:0.109.0
+    container_name: onified-otel-collector-logs
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol/config.yaml"]
+    depends_on:
+      - opensearch
+    volumes:
+      - ./otel-collector-logs/config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "8890:8888"   # collector's own telemetry metrics (avoid clash with the other collector's 8888)
+
+volumes:
+  opensearch-data:

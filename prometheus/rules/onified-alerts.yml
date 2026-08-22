@@ -1,0 +1,78 @@
+# Default Onified alert rules (alerting-as-code) over Spring Boot Actuator / Micrometer metrics.
+# Loaded by Prometheus (rule_files in prometheus.yml); fired alerts route to Alertmanager (:9093).
+# These are sensible starting thresholds — tune per service SLO.
+groups:
+  - name: onified-availability
+    rules:
+      - alert: InstanceDown
+        expr: up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Target down: {{ $labels.job }} ({{ $labels.instance }})"
+          description: "Prometheus could not scrape {{ $labels.instance }} for 2m."
+
+  - name: onified-http
+    rules:
+      - alert: HighHttpErrorRate
+        # 5xx share of all requests over 5m, per job.
+        expr: |
+          sum by (job) (rate(http_server_requests_seconds_count{status=~"5.."}[5m]))
+            /
+          clamp_min(sum by (job) (rate(http_server_requests_seconds_count[5m])), 1e-9) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High 5xx rate on {{ $labels.job }}"
+          description: "5xx error rate is above 5% over the last 5m on {{ $labels.job }}."
+
+      - alert: HighHttpLatency
+        # Mean request latency (sum/count) over 5m, per job — works without histogram buckets.
+        expr: |
+          sum by (job) (rate(http_server_requests_seconds_sum[5m]))
+            /
+          clamp_min(sum by (job) (rate(http_server_requests_seconds_count[5m])), 1e-9) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High average HTTP latency on {{ $labels.job }}"
+          description: "Mean request latency is above 1s over the last 5m on {{ $labels.job }}."
+
+      - alert: HighHttpLatencyP99
+        # True p99 — needs percentile-histogram buckets (enabled via
+        # management.metrics.distribution.percentiles-histogram in application-prod.yml).
+        expr: |
+          histogram_quantile(0.99,
+            sum by (job, le) (rate(http_server_requests_seconds_bucket[5m]))) > 2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High p99 HTTP latency on {{ $labels.job }}"
+          description: "p99 request latency is above 2s over the last 5m on {{ $labels.job }}."
+
+  - name: onified-runtime
+    rules:
+      - alert: JvmHeapHigh
+        expr: |
+          sum by (job, instance) (jvm_memory_used_bytes{area="heap"})
+            /
+          clamp_min(sum by (job, instance) (jvm_memory_max_bytes{area="heap"}), 1) > 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "JVM heap >90% on {{ $labels.job }}"
+          description: "Heap usage has been above 90% for 10m on {{ $labels.instance }}."
+
+      - alert: HighCpuUsage
+        expr: process_cpu_usage > 0.85
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High CPU on {{ $labels.job }}"
+          description: "process_cpu_usage has been above 85% for 10m on {{ $labels.instance }}."

@@ -1,0 +1,58 @@
+HOW TO RUN A SERVICE LOCALLY
+
+1. Build the service's bootJar from repo root:
+   .\gradlew :service:platform:<service>:bootJar -x test
+
+   Example: .\gradlew :service:platform:geo:bootJar -x test
+
+2. cd into local-dev:
+   cd local-dev
+
+3. Build and start the service container:
+   docker compose up <svc> --build -d
+
+   Example: docker compose up geo --build -d
+
+4. Check status:
+   docker compose ps <svc>
+
+5. Tail logs:
+   docker compose logs -f <svc>
+
+NOTES
+- <svc> is the docker-compose service name (see docker-compose*.yml in this folder), not always identical to the gradle module path.
+- This is a local testing environment. If a DB issue blocks a service from starting, fix it directly with SQL against the local DB rather than through migrations/tooling.
+- If a service needs seed data to run, seed it directly and leave the seed data in place (permanent) so future runs of the service don't need reseeding.
+
+CALLING SERVICES DURING TESTING
+- PREFERRED: go through the gateway. Gateway runs on localhost:8765 (see docker-compose.yml, service "internal-gateway"). Route config: local-dev/gateway-routes-local.yml — e.g. /api/v1/geo/** routes straight to the geo service.
+- internal-gateway has been crash-looping locally (NoClassDefFoundError: ai.onified.rbac.properties.RbacProperties — a classpath issue in its own jar, unrelated to any service logic). Until that's fixed, use the direct-to-service fallback below.
+
+GET AN EXTERNAL (OTP dev) TOKEN, via gateway (localhost:8765) or directly against IAM (localhost:8082) if gateway is down:
+
+curl --location 'http://localhost:8082/api/v1/otp-auth/token/generate' \
+--header 'Content-Type: application/json' \
+--data '{"username": "Nishkarsh Singh"}'
+
+Normally the gateway exchanges this external token for an internal (RS256) one on every request.
+With gateway down, dev-internal-token-all-services.txt in this folder is a pre-minted internal
+token (10-year expiry, full authorities for the test user, tenant "beta") signed with the shared
+dev RS256 key every service's ONIFIED_RBAC_RS256_TRUSTED_PUBLIC_KEYS already trusts — NOT scoped
+to geo, use it directly against ANY service's own port (geo: 8096, iam: 8082, etc.), bypassing
+both the gateway and IAM's real login/token-exchange flow entirely:
+
+curl -s -K <(printf 'header = "Authorization: Bearer %s"\nheader = "Content-Type: application/json"\nheader = "Idempotency-Key: idk_<a-real-uuid>"' "$(cat dev-internal-token-all-services.txt)") \
+  -X POST --data-binary '{"page":0,"size":5}' http://localhost:8096/api/v1/geo/geofences/search
+
+Notes:
+- The token is too large for a plain -H argument (shell argv limit) — always pass headers via a
+  curl -K config file, or -K <(...) process substitution.
+- Every non-idempotent (POST/PUT/PATCH/DELETE) geo endpoint requires an "Idempotency-Key: idk_<uuid>"
+  header (any valid UUID, no auto-formatting) — G03-R03.
+- If dev-internal-token-all-services.txt's authorities become stale (e.g. a new controller needs an authority the
+  seeded roles don't have), grant it via iam.role_authority_mapping directly in Postgres (see
+  services/platform/iam authority_definitions/role_authority_mapping tables), then re-mint using
+  the same flow: POST /api/v1/otp-auth/token/generate on IAM -> GET
+  /internal/v1/rbac-jwt-tokens/context on IAM with that token -> sign a new RS256 JWT shaped like
+  gateway's TokenExchangeService.generateNewToken() using the same dev private key already in
+  docker-compose.yml (SECURITY_JWT_PRIVATE_KEY / ONIFIED_GATEWAY_JWT_PRIVATE_KEY).

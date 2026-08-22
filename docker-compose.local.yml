@@ -1,0 +1,281 @@
+# =============================================================================
+# Local infrastructure for booting Onified services from this monorepo.
+# Brings up Postgres + Kafka + Zookeeper + Redis + Vault, plus the observability
+# stack (Prometheus + Grafana + OpenTelemetry Collector + Alertmanager), on the
+# ports services expect by default in `application.yml`/`application-local.yml`.
+#
+# Observability UIs once up:
+#   Prometheus    http://localhost:9090
+#   Grafana       http://localhost:3001   (anonymous Admin; Prometheus pre-wired)
+#   Alertmanager  http://localhost:9093
+#   OTel Collector OTLP gRPC :4317 / HTTP :4318  (enable LOGGING_SDK_OTEL_ENABLED=true)
+# (OpenSearch for logs lives in docker-compose.elasticsearch.yml.)
+#
+# Usage:
+#   docker compose -f deployment/docker-compose.local.yml up -d
+#   docker compose -f deployment/docker-compose.local.yml ps
+#   docker compose -f deployment/docker-compose.local.yml logs -f prometheus
+#   docker compose -f deployment/docker-compose.local.yml down -v   # destroy data
+# =============================================================================
+
+# NOTE: no top-level `name:` here anymore — this file is always included via
+# docker-compose.yml's `include:` directive, which already declares
+# `name: onified-full`. Having a DIFFERENT name here caused Compose to
+# sometimes namespace this file's volumes (postgres-data, redis-data, etc.)
+# under "onified-local_*" and sometimes under "onified-full_*" depending on
+# how compose was invoked — silently splitting postgres's data across two
+# separate volumes instead of one, which looked like data not persisting.
+# If you ever need to run this file standalone (not via the include), pass
+# an explicit project name instead: `docker compose -p onified-full -f
+# docker-compose.local.yml ...`.
+
+services:
+  postgres:
+    image: timescale/timescaledb-ha:pg17
+    container_name: onified-postgres
+    restart: unless-stopped
+    environment:
+      # Matches application-local.yml across all services.
+      # When restoring the beta backup, pg_restore into this same DB:
+      #   docker exec -i onified-postgres pg_restore -U postgres -d onified_beta_local < beta-backup.dump
+      POSTGRES_DB: onified_beta_local
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: "Thekapilg"
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      # Host port 5433, NOT 5432 — this machine has native Windows PostgreSQL
+      # services installed (13/16/17) that bind 5432 on their own, and Docker's
+      # port-forwarder binding the IPv6 side of the same port let both "work"
+      # simultaneously, silently routing host connections to whichever one a
+      # given client happened to resolve first (IPv4 vs IPv6) — the container
+      # every time this was checked appeared to intermittently "not be there".
+      # Every service in this compose file reaches Postgres via the internal
+      # hostname "postgres:5432" (Docker's own DNS), NOT this host mapping, so
+      # this change affects nothing except host-side tools (psql, DBeaver,
+      # pgAdmin) connecting from Windows itself — point those at 5433 now.
+      - "5432:5432"
+      
+    volumes:
+      # timescaledb-ha's PGDATA is /home/postgres/pgdata/data, NOT the usual
+      # /var/lib/postgresql/data — mounting the latter silently leaves the real
+      # data dir in the container layer, so every recreate wiped the DB.
+      - postgres-pgdata:/home/postgres/pgdata
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: onified-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: onified-zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: onified-kafka
+    restart: unless-stopped
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  vault:
+    image: hashicorp/vault:1.16
+    container_name: onified-vault
+    restart: unless-stopped
+    cap_add:
+      - IPC_LOCK
+    ports:
+      - "8200:8200"
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: root
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+
+  # Vault dev-mode is 100% in-memory — every secret is gone on restart. This
+  # one-shot job re-seeds the KV secrets content/master-data need to boot, so
+  # nobody has to run `vault kv put` by hand after every fresh `up`. Values
+  # come from deployment/.env (gitignored); the inline defaults below are a
+  # fallback only, not the source of truth.
+  vault-seed:
+    image: hashicorp/vault:1.16
+    container_name: onified-vault-seed
+    restart: "no"
+    depends_on:
+      vault:
+        condition: service_started
+    environment:
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN: root
+      # Same plaintext dev-only DB password already used inline throughout
+      # docker-compose.yml (SPRING_DATASOURCE_PASSWORD, etc.) — no separate
+      # .env needed, matches the repo's existing convention.
+      # "postgresql://postgres", not just "postgres": ProxySecretData.toJdbcUrl()
+      # (vault-tenant-proxy-client 1.3.1) builds "jdbc:" + host + ":" + port + "/" +
+      # dbName with NO driver scheme inserted — a real bug in that library. Baking
+      # the scheme into "host" is the workaround until it's fixed upstream; verified
+      # empirically 2026-08-01 (a bare hostname produces "jdbc:postgres:5432/db",
+      # which Postgres's driver rejects outright).
+      MASTERDATA_DB_HOST: postgresql://postgres
+      MASTERDATA_DB_PORT: "5432"
+      MASTERDATA_DB_NAME: onified_beta_local
+      MASTERDATA_DB_USERNAME: postgres
+      MASTERDATA_DB_PASSWORD: Thekapilg
+      # One "{tenantKey}-kv" mount per tenant you log in as — see the loop below
+      # and the matching list in docker-compose.vault.yml's vault2-seed. The
+      # restored DB's real tenant keys (iam.tenant_accounts) are beta / acme /
+      # betashared; "localtest" is kept for the synthetic local tenant.
+      SEED_TENANT_KEYS: "localtest beta acme betashared"
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        until vault status >/dev/null 2>&1; do sleep 1; done
+        vault secrets enable -path=kv -version=2 kv 2>/dev/null || true
+        vault kv put kv/master-data-service/db_cred \
+          host="$$MASTERDATA_DB_HOST" \
+          port="$$MASTERDATA_DB_PORT" \
+          db_name="$$MASTERDATA_DB_NAME" \
+          username="$$MASTERDATA_DB_USERNAME" \
+          password="$$MASTERDATA_DB_PASSWORD"
+        # secret-proxy:v2 (RS256) always routes to a per-tenant mount named
+        # "{tenantKey}-kv" (confirmed via its own debug logs — NOT path-substitution
+        # based, it's a fixed convention regardless of the secretPath's own text),
+        # so every tenant key you log in as needs its own mount — hence the loop
+        # over SEED_TENANT_KEYS rather than the single hardcoded "localtest".
+        # Field names must match vault-tenant-proxy-client 1.3.1's ProxySecretData:
+        # host/port/db_name/username/password (snake_case db_name, not dbName).
+        for T in $$SEED_TENANT_KEYS; do
+          vault secrets enable -path=$$T-kv -version=2 kv 2>/dev/null || true
+          vault kv put $$T-kv/master-data-service/db_cred \
+            host="$$MASTERDATA_DB_HOST" \
+            port="$$MASTERDATA_DB_PORT" \
+            db_name="$$MASTERDATA_DB_NAME" \
+            username="$$MASTERDATA_DB_USERNAME" \
+            password="$$MASTERDATA_DB_PASSWORD"
+          echo "vault-seed: seeded $$T-kv/master-data-service/db_cred"
+        done
+        echo "vault-seed: done"
+
+  # ── Observability stack (metrics · dashboards · tracing · alerting) ─────────
+  # Matches the observability service's local defaults: PROMETHEUS_URL=:9090,
+  # GRAFANA_URL=:3001, ALERTMANAGER_URL=:9093, OTEL_COLLECTOR_ENDPOINT=:4317.
+  # (OpenSearch lives in docker-compose.elasticsearch.yml.)
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: onified-prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    extra_hosts:
+      # Lets Prometheus (in-container) scrape services running on the host via bootRun.
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: onified-grafana
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      # Local convenience: open dashboards without logging in.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_USERS_DEFAULT_THEME: dark
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:3000/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.109.0
+    container_name: onified-otel-collector
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol/config.yaml"]
+    ports:
+      - "4317:4317"   # OTLP gRPC (set LOGGING_SDK_OTEL_ENABLED=true + endpoint=http://localhost:4317)
+      - "4318:4318"   # OTLP HTTP
+      - "8889:8889"   # Prometheus exporter (collector → scraped by Prometheus)
+    volumes:
+      - ./otel-collector/config.yaml:/etc/otelcol/config.yaml:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: onified-alertmanager
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+
+volumes:
+  # New name on purpose: the old `postgres-data` volume holds an orphaned PG17
+  # data dir owned by uid 70 (from the pre-timescaledb `postgres` image), which
+  # uid 1000 in this image cannot read. Left in place as a backup; remove with
+  # `docker volume rm onified-full_postgres-data` once you don't need it.
+  postgres-pgdata:
+  redis-data:
+  prometheus-data:
+  grafana-data:

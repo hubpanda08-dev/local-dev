@@ -1,0 +1,1822 @@
+# =============================================================================
+# Onified — Full stack docker compose
+#
+# 15 platform services + 1 apps service (cargo), each as a fully self-contained
+# block. No YAML anchors, no inter-service `depends_on` — comment out any
+# service block and the rest keep running unchanged.
+#
+# Infrastructure (postgres / redis / kafka / zookeeper / vault) is pulled in
+# via `include: docker-compose.local.yml` — leave that alone unless you want
+# to swap infra. Each application servic  e still declares its own infra
+# depends_on so it waits for postgres/redis/kafka to be HEALTHY before booting.
+# =============================================================================
+#
+# QUICK START
+# -----------------------------------------------------------------------------
+#   export GITLAB_USER=<your-user> GITLAB_TOKEN=<your-token>
+#   docker compose -f deployment/docker-compose.yml up -d
+#
+# To skip a service: comment out its ENTIRE block (from the `═══` divider
+# above the service name down to the `─` divider before the next service).
+# Nothing else needs to change — there are no inter-service depends_on.
+#
+# To run only ONE service + infra:
+#   docker compose -f deployment/docker-compose.yml up -d iam
+# (Compose will start postgres/redis/kafka/vault automatically via the
+# include + the service's own depends_on.)
+#
+# COMMENT-OUT SAFETY MAP
+# -----------------------------------------------------------------------------
+# Disabling these has WIDE blast radius (other services calling them error out):
+#   • iam        — every other service calls /internal/v1/constraints
+#   • content         — iam, notification, work-management need files
+#   • internal-gateway         — frontend can't reach anything
+#
+# Disabling these is mostly safe (only specific upstream callers break):
+#   • platform-data, master-data, analytics, billing-subscription, governance,
+#     notification, integration, job-orchestration, work-management, workflow,
+#     sso, geo, cargo, external-gateway
+#
+# RESOURCE BUDGET
+# -----------------------------------------------------------------------------
+#   First build: 30–60 min sequential (use --parallel if you have the cores).
+#   Runtime RAM: ~16–24 GB for the full stack. Disable services you don't need.
+#   Disk: ~10 GB for images + postgres volume.
+# =============================================================================
+
+name: onified-full
+
+include:
+  - docker-compose.local.yml
+  # secret-proxy (main vault:8200, container-hostname "secret-proxy") — master-data's
+  # TenantRoutingDataSource requires this actually running (SECRET_PROXY_BASE_URL:
+  # http://secret-proxy:8200). Previously a separate, undocumented-in-compose
+  # `-f docker-compose.secret-proxy.yml` invocation; folded in here.
+  - docker-compose.secret-proxy.yml
+  # vault2 + its own secret-proxy (v2/RS256, renamed "sidecar-*" to avoid
+  # colliding with the "secret-proxy"/"redis" names above) + vault2-seed: the
+  # sidecar stack cargo's vault-tenant DataSource depends on
+  # (SECRET_PROXY_BASE_URL points at its host-mapped port, :9200). Previously
+  # started as a separate `docker compose -f docker-compose.vault.yml -f
+  # docker-compose.sidecar.yml up` invocation with no seeding at all — folded
+  # in here so one `docker compose up` brings up the whole stack, fully
+  # seeded, no manual steps.
+  - docker-compose.vault.yml
+  - docker-compose.sidecar.yml
+  # opensearch + dashboards + otel-collector-logs. Promoted from an optional
+  # `-f` overlay to infra: work-management's es-sync indexer (and platform-data's
+  # outbox indexer) need a cluster to write to, so it comes up with everything
+  # else. Reached in-network as http://opensearch:9200; host-mapped on 9210
+  # (NOT 9200 — sidecar-secret-proxy already owns host 9200, see
+  # docker-compose.sidecar.yml). docker-compose.elasticsearch.yml is the
+  # Elasticsearch alternative and is intentionally NOT included — it binds the
+  # same host 9200 and we standardised on OpenSearch.
+  - docker-compose.opensearch.yml
+
+# Build-time secrets — read GitLab Maven creds from your shell env.
+# Same secrets get re-used by every service block below via `build.secrets`.
+secrets:
+  gitlab_user:
+    environment: GITLAB_USER
+  gitlab_token:
+    environment: GITLAB_TOKEN
+
+networks:
+  default:
+    name: onified-network
+
+services:
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # GATEWAY  (port: 8765)            tier: 4 — entry point
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Role:       Spring Cloud Gateway (reactive). Routes /api/v1/** to platform
+  #             services. Owns the L2 tenant-host perimeter check.
+  # Calls:      iam (token exchange + host-map), all platform services as
+  #             routed downstream.
+  # Called by:  frontend / external clients.
+  # If commented out: front-end and external clients can't reach any service
+  #                   through the routed perimeter. Every platform service does
+  #                   still carry its own 127.0.0.1 host port mapping (full map
+  #                   in onified-ports.md), so you can curl any of them directly
+  #                   from this machine — but a direct call skips the internal-gateway's
+  #                   token exchange and L2 tenant-host check, so it is a
+  #                   dev/debug path only, never how the frontend talks to them.
+  #                   Gateway itself is the only 0.0.0.0 (LAN-visible) binding.
+  # ───────────────────────────────────────────────────────────────────────────
+  internal-gateway:
+    container_name: onified-internal-gateway
+    image: onified/internal-gateway:dev
+    restart: unless-stopped
+    build:
+      context: ..
+      dockerfile: services/platform/internal-gateway/Dockerfile.local-dev
+      secrets:
+        - source: gitlab_user
+        - source: gitlab_token
+    environment:
+      # ── Profile + DB ──────────────────────────────────────────────────────
+      SPRING_PROFILES_ACTIVE: local
+      # Was hardcoded to "localhost:5432" — wrong inside a container (that's the
+      # container itself, not the postgres one). DB_HOST below already resolves
+      # correctly via the profile's own ${DB_HOST} template, so just let it.
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: onified_beta_local
+      DB_SCHEMA: internal_gateway
+      SPRING_JPA_HIBERNATE_DDL_AUTO: update
+      DB_USERNAME: postgres
+      DB_PASSWORD: "Thekapilg"
+      
+      # platform_internal-gateway_service had zero tables (flyway.enabled=false locally,
+      # same root cause as iam/content/geo before their fixes).
+      SPRING_FLYWAY_ENABLED: "false"
+      # ── Kafka / Redis ─────────────────────────────────────────────────────
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ""
+      # ── Cross-service URLs ────────────────────────────────────────────────
+      USER_SERVICE_URL: http://iam:8082
+      # ── Gateway routing table (SSOT) ──────────────────────────────────────
+      # application-local.yml's route URIs default to http://localhost:<port>
+      # (host-bootRun mode, everything on one machine). Inside this container
+      # "localhost" is the internal-gateway container itself, so every route 404/503s
+      # unless overridden here to the other services' Docker Compose hostnames
+      # — this block is the one place that switch happens for local Docker use.
+      IDENTITY_SERVICE_URL: http://iam:8082
+      CONTENT_SERVICE_URL: http://content:8081
+      WORKFLOW_SERVICE_URL: http://workflow:8093
+      NOTIFICATION_SERVICE_URL: http://notification:8089
+      ANALYTICS_SERVICE_URL: http://analytics:8087
+      SECURITY_GOVERNANCE_SERVICE_URL: http://governance:8088
+      INTEGRATION_SERVICE_URL: http://integration:8090
+      BILLING_SUBSCRIPTION_SERVICE_URL: http://billing-subscription:8084
+      PLATFORM_DATA_SERVICE_URL: http://platform-data:8085
+      MASTER_DATA_SERVICE_URL: http://master-data:8086
+      CARGO_SERVICE_URL: http://cargo:8094
+      JOB_ORCHESTRATION_SERVICE_URL: http://job-orchestration:8095
+      WORK_MANAGEMENT_SERVICE_URL: http://work-management:8092
+      GEO_SERVICE_URL: http://geo:8096
+      # sso was merged into iam upstream — routes still say SSO-SERVICE-*
+      # but the traffic is iam's now.
+      SSO_SERVICE_URL: http://iam:8082
+      # ── Logging SDK ───────────────────────────────────────────────────────
+      LOGGING_SDK_BOOTSTRAP_SERVERS: kafka:29092
+      LOGGING_SDK_OTEL_ENABLED: "false"
+      # ── Auth secrets (DEV ONLY) ───────────────────────────────────────────
+      JWT_SECRET_KEY: "ZGV2LW9ubHktc2VjcmV0LW5vdC1mb3ItcHJvZC1kby1ub3QtdXNlLTMyYnl0ZXM="
+      ONIFIED_JWT_SECRET_KEY: "ZGV2LW9ubHktc2VjcmV0LW5vdC1mb3ItcHJvZC1kby1ub3QtdXNlLTMyYnl0ZXM="
+      # JwtKeyProviderConfig's "iamVerifierKeyProvider" (verifies Token 1,
+      # the client token iam mints) defaults to HS256 and was never told
+      # iam is on RS256 here — TokenExchangeService rejected every real
+      # login token with "algorithm mismatch" (iam's rbac-library 3.2.7
+      # forbids HS256 entirely, so iam can ONLY issue RS256). This is
+      # iam's own public key (same value as ONIFIED_RBAC_RS256_TRUSTED_
+      # PUBLIC_KEYS below it uses everywhere else) — internal-gateway only verifies
+      # with it, never signs.
+      SECURITY_JWT_ALGORITHM: "RS256"
+      SECURITY_JWT_PUBLIC_KEY: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2bKXEiiD+/qZrfMRJUGVsnj/5mBLr+gdJZpmVJ4XqDaYx7i59V9EMWN+DvzAa08QaCgGbfGTQCVI6Kxjl1cr7GPPIp0XzmZJ6vAbnkXZBEiyfwDXo7a4EnOGzi0B493zyYru/CNbdMvS4LjNmkrUxb32zbVHhX4Zn51Ml0Uivk36sBIyamNAAIrPzG3LgdR1qbZzqc+fWDnuAEIzYhC+EmIGimC+eOgM4NztK9U/7fqaF0VDgxXq1R4srx4pimp3AabdiwkNdYEslOc7gY+3z5+XAKfakP7yrWP6n5hdceV53fwCakF9gLq8u9adfBkZfgMQU285dhvBMWz0zgcwkwIDAQAB"
+      # JwtKeyProviderConfig's OTHER role — "internal-gatewaySigningKeyProvider" — signs
+      # Token 3 (the internal token internal-gateway forwards to every backend service
+      # after exchange). Also defaults to HS256, so workflow/master-data/etc.
+      # (rbac-library 3.2.7, RS256-only) reject it: "no trusted key configured
+      # for algorithm HS256". Reusing iam's own keypair here (not a
+      # separate one) — every backend service already trusts this exact
+      # public key via ONIFIED_RBAC_RS256_TRUSTED_PUBLIC_KEYS.
+      ONIFIED_GATEWAY_JWT_ALGORITHM: "RS256"
+      ONIFIED_GATEWAY_JWT_PRIVATE_KEY: "MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDZspcSKIP7+pmt8xElQZWyeP/mYEuv6B0lmmZUnheoNpjHuLn1X0QxY34O/MBrTxBoKAZt8ZNAJUjorGOXVyvsY88inRfOZknq8BueRdkESLJ/ANejtrgSc4bOLQHj3fPJiu78I1t0y9LguM2aStTFvfbNtUeFfhmfnUyXRSK+TfqwEjJqY0AAis/MbcuB1HWptnOpz59YOe4AQjNiEL4SYgaKYL546Azg3O0r1T/t+poXRUODFerVHiyvHimKancBpt2LCQ11gSyU5zuBj7fPn5cAp9qQ/vKtY/qfmF1x5Xnd/AJqQX2Aury71p18GRl+AxBTbzl2G8ExbPTOBzCTAgMBAAECggEAXiFQHDxjkWVS5PmobL0WjuSt9b2mjGmnjLZdz/HJ1eTBm/4+fiASuu5DuBRG2T+HHxpLaWee3Yoho+XCbFJ3fg/MJTHa9Naa2Ji4wG+APk92yt6g3zunDOdiHy0r140FmBxYaLKbHX3ycVPHJxN7PAN/P4RGaCzVxIP99ZyhwLnnwDPose8E+XhlbLQVQUlxCy6X0lWI6o/ACidZbekBIN6IFoNUrZ3MVvtjQQND1ZyRv5ySZ/hgB7M7ADGSp7vP1iu/NdK6dD+yElvbzJrYTMnVeZ+OxH0CMy9fFFa10GZSJEhhRtD3edUqLmw/7BAP5zfEeA+pAU8+cyoVlOov6QKBgQD1arXNJlw7ilOQlUq4eu32YjWZI4QK0S4eOXilShQCx4qfvunzvJN/PGX24e0HQyGiNgC/IkC1KjXSl25RjSL4Z/DZL/VrrZSTkORc+DE2KHdYRuJHQsX2+ByXRggG1j9GZ0XiXq5FD9lMw84oaKe6UPhmBhZ8FUxuYkk1BzZwCwKBgQDjFd9YBNLn5FdM5qPJP2trgwpa5LS7uHOOiLmYhozOEOoHq9Y76w3eD23nRCANeiMjblpLFsdljlSxyAnL2E7dmOWuaRbDpR1v3GcEtb9JxtQ+rSaqF+PLtqNIoUgn0fJX61pwXUtMZhaY/cd9r+AJxVSHn05eQDMS/VEC93zumQKBgHAlf0ZsDSG4KE+dqTN8GVnJryx3qlM3G5f8M0F1BIfwn0w4dbhHqC8wbnfO7f2vk6MIgnbVNDSVQVsmj+b8U8qn1Muqur+l5os4XuKNGA/jlgXk/moJ/WTKJGaMPgbByNBnSOwU0BYHFAmcQIz+pgbiEWCtz4CMSwz2JPXygdHZAoGAKSLtMqStEBTtO6EMSoiSjQdP+Oc1Vkwzor5h4J9/IlUuD/Ww+Wm7OV7SKfLNW6OkeeajtLaLqHoAHbR/Ec49eycXdGDVHtvqWTkz8EZ8QIEkMbZsKqPpQB31tlKBH7WIkSSxXWmJGm3j6hMO8FXL3/k/NtJFAA3hMq9w3Xi3yQECgYB5QbEgGzlWpsGw/R5Kh3K8Ns2e/c6AhpVbsZzNrl/uPb1Ezi1NSprv4gxbXExWPBDHbNcHp2SAAVEFQv1rBskj2VrE+fhMM/YCeKkKlQMyNrPZUm/5HCKFkGqxPJ+AFEj/jVK6dBfICohxhoI0nRI5aufDZb6v25icbsyRwlhGjw=="
+      ONIFIED_GATEWAY_JWT_PUBLIC_KEY: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2bKXEiiD+/qZrfMRJUGVsnj/5mBLr+gdJZpmVJ4XqDaYx7i59V9EMWN+DvzAa08QaCgGbfGTQCVI6Kxjl1cr7GPPIp0XzmZJ6vAbnkXZBEiyfwDXo7a4EnOGzi0B493zyYru/CNbdMvS4LjNmkrUxb32zbVHhX4Zn51Ml0Uivk36sBIyamNAAIrPzG3LgdR1qbZzqc+fWDnuAEIzYhC+EmIGimC+eOgM4NztK9U/7fqaF0VDgxXq1R4srx4pimp3AabdiwkNdYEslOc7gY+3z5+XAKfakP7yrWP6n5hdceV53fwCakF9gLq8u9adfBkZfgMQU285dhvBMWz0zgcwkwIDAQAB"
+      # ── L2 tenant-host binding ────────────────────────────────────────────
+      ONIFIED_TENANT_HOST_BINDING_ENFORCE: "false"
+      # ── CORS ──────────────────────────────────────────────────────────────
+      # Same as application-beta.yml's onified.cors.allowed-origins: "*" —
+      # explicit here so the frontend (localhost:3000 or any other dev port)
+      # is never blocked, instead of relying on CorsConfig.java's implicit
+      # "*" default.
+      ONIFIED_CORS_ALLOWED_ORIGINS: "*"
+      # ── Heap override (matches Dockerfile default) ────────────────────────
+      HEAP: "768m"
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka:    { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    ports:
+      - "8765:8765"
+    volumes:
+      # ── Route-table override for the containerised stack ───────────────────
+      # The in-jar application-local.yml hardcodes every route to
+      # http://localhost:<port>, which is correct for host bootRun but points at
+      # the GATEWAY ITSELF inside Docker — every proxied call died with
+      # "Connection refused: localhost/127.0.0.1:8082" and returned 503.
+      # WORKDIR is /app, and Spring Boot's file:./config/ location outranks the
+      # classpath, so this file's routes list replaces the in-jar one (lists are
+      # replaced, not merged). All other local-profile properties still apply.
+      # Regenerate with deployment/gen-internal-gateway-routes.sh when routes change.
+      - ./internal-gateway-routes-local.yml:/app/config/application-local.yml:ro
+    deploy:
+      resources:
+        limits:
+          memory: 1.25g
+          cpus: '1.0'
+        reservations:
+          memory: 768m
+          cpus: '0.25'
+    networks:
+      - default
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # EXTERNAL-GATEWAY  (port: 8099)   tier: 4 — untrusted north-south entry point
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Role:       Spring Cloud Gateway (reactive). Client-facing entry point for
+  #             external/partner API traffic — client JWT + OAuth2 client-creds
+  #             validation, route registry (gw_route/gw_channel), rate limiting,
+  #             quota enforcement, usage metering. Forwards to `internal-gateway` (the
+  #             internal internal-gateway) after minting an internal context token.
+  # Calls:      internal-gateway (downstream forwarding), governance (rate-limit policy),
+  #             platform-data (sequence/business-code generation), redis, kafka.
+  # Called by:  external/partner clients (not the frontend — that goes through
+  #             `internal-gateway` directly).
+  # If commented out: external/partner API access is unavailable. Internal
+  #                   frontend traffic via `internal-gateway` is unaffected.
+  # ───────────────────────────────────────────────────────────────────────────
+  external-gateway:
+    container_name: onified-external-gateway
+    image: onified/external-gateway:dev
+    restart: unless-stopped
+    build:
+      context: ..
+      dockerfile: services/platform/external-gateway/Dockerfile.local-dev-jar
+      secrets:
+        - source: gitlab_user
+        - source: gitlab_token
+    environment:
+      # ── Profile + DB ──────────────────────────────────────────────────────
+      SPRING_PROFILES_ACTIVE: local
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/onified_beta_local?currentSchema=external_internal-gateway
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: onified_beta_local
+      DB_SCHEMA: external_internal-gateway
+      SPRING_JPA_HIBERNATE_DDL_AUTO: update
+      DB_USERNAME: postgres
+      DB_PASSWORD: "Thekapilg"
+      SPRING_FLYWAY_ENABLED: "false"
+      # ── Kafka / Redis ─────────────────────────────────────────────────────
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ""
+      # ── Cross-service URLs ────────────────────────────────────────────────
+      EXTERNAL_GATEWAY_INTERNAL_GATEWAY_URL: http://internal-gateway:8765
+      RATE_LIMIT_GOVERNANCE_URL: http://governance:8088
+      PLATFORM_DATA_SERVICE_URL: http://platform-data:8085
+      # ── Logging SDK ───────────────────────────────────────────────────────
+      LOGGING_SDK_BOOTSTRAP_SERVERS: kafka:29092
+      LOGGING_SDK_OTEL_ENABLED: "false"
+      # ── Auth secrets (DEV ONLY) ───────────────────────────────────────────
+      ONIFIED_RBAC_JWT_ISSUER: onified-gateway
+      ONIFIED_RBAC_TOKEN_SECRET: "ZGV2LXJiYWMtdG9rZW4tc2VjcmV0LTMyLWJ5dGVzISE="
+      ONIFIED_RBAC_CONSTRAINT_FETCH_URL: http://iam:8082/internal/v1/constraints/fetch
+      # ── Heap override (matches Dockerfile default) ────────────────────────
+      HEAP: "1g"
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka:    { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    # Host port mapping (see onified-ports.md). Bound to 127.0.0.1 so the
+    # service is reachable from this machine for dev/curl but is NOT
+    # published to the LAN — every block below carries dev-only secrets and
+    # no direct-access auth perimeter. Normal traffic still goes via internal-gateway.
+    ports:
+      - "127.0.0.1:8099:8099"
+    deploy:
+      resources:
+        limits:
+          memory: 1.5g
+          cpus: '1.0'
+        reservations:
+          memory: 1g
+          cpus: '0.25'
+    networks:
+      - default
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # IDENTITY  (port: 8082)           tier: 1 — foundation
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Role:       Source of truth for users, tenants, RBAC, JWT, MFA, OTP,
+  #             passkey, app/route manifest. Hosts /internal/v1/constraints/
+  #             fetch which every rbac-library consumer calls.
+  # Calls:      content (avatar uploads).
+  # Called by:  EVERY other platform service (constraint fetch, token exchange).
+  # If commented out: every service that validates tokens or fetches
+  #                   constraints will fail. Only safe to disable for very
+  #                   narrow demos.
+  # ───────────────────────────────────────────────────────────────────────────
+  iam:
+    container_name: onified-iam
+    image: onified/iam:dev
+    restart: unless-stopped
+    build:
+      context: ..
+      dockerfile: services/platform/iam/Dockerfile.local-dev
+      secrets:
+        - source: gitlab_user
+        - source: gitlab_token
+    environment:
+      # ── Profile + DB ──────────────────────────────────────────────────────
+      SPRING_PROFILES_ACTIVE: local
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/onified_beta_local?currentSchema=iam
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: "Thekapilg"
+      DB_USERNAME: postgres
+      DB_PASSWORD: "Thekapilg"
+      # Flyway disabled locally — the iam schema is restored from the beta dump, not built
+      # from V1, so Hibernate reshapes it on boot instead (same pairing as the other
+      # services' local config).
+      # DB_SCHEMA is REQUIRED: application-local.yml pipes it into Hibernate's
+      # default_schema as a bare ${DB_SCHEMA} with no fallback. iam is also what
+      # deployment/postgres-init/02-schemas.sql pre-creates on a fresh volume.
+      SPRING_FLYWAY_ENABLED: "false"
+      DB_SCHEMA: iam
+      SPRING_FLYWAY_SCHEMAS: iam
+      SPRING_JPA_HIBERNATE_DDL_AUTO: update
+      # ── Kafka / Redis ─────────────────────────────────────────────────────
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: "6379"
+      # ── Cross-service URLs ────────────────────────────────────────────────
+      FILE_STORAGE_SERVICE_URL: http://content:8081
+      # Was unset here (application-local.yml's own default is "http://localhost:8085",
+      # correct for bare-metal but wrong in Docker — platform-data is a separate
+      # container). MetadataCatalog/EntityRegistry/ServiceRegistry gRPC internal-gateways
+      # all derive their platform-data target host from this same property, so
+      # without it iam logged "Connection refused: localhost/127.0.0.1:9090"
+      # on every boot (see application-local.yml's onified.s2s.grpc.targets for
+      # the matching port override — this alone only fixes the host).
+      PLATFORM_DATA_SERVICE_URL: http://platform-data:8085
+      # gRPC server (DocumentService/EntityRegistry/etc. inbound) + s2s gRPC client targets.
+      # The 4 *_SERVICE_URL/*_BASE_URL vars below feed application-local.yml's
+      # onified.s2s.grpc.targets map (each internal-gateway resolves its target's HOST from these same
+      # REST base-urls via GrpcTargetResolver.hostOf(...) — see EntityRegistryGrpcGateway.java
+      # and siblings). Missing any one of these means that target's grpc key never resolves to
+      # this compose network's service name, and the block is silently ignored (falls back to
+      # dns:///localhost:9090 — a real, previously-unwired bug for content/billing/governance/
+      # notification; only platform-data was wired before).
+      GRPC_SERVER_PORT: "8500"
+      CONTENT_SERVICE_URL: http://content:8081
+      ONIFIED_BILLING_BASE_URL: http://billing-subscription:8084
+      GOVERNANCE_SERVICE_URL: http://governance:8088
+      ONIFIED_NOTIFICATION_BASE_URL: http://notification:8089
+      # ── Logging SDK ───────────────────────────────────────────────────────
+      LOGGING_SDK_BOOTSTRAP_SERVERS: kafka:29092
+      LOGGING_SDK_OTEL_ENABLED: "false"
+      # ── Auth + crypto secrets (DEV ONLY) ──────────────────────────────────
+      ONIFIED_JWT_SECRET_KEY: "ZGV2LW9ubHktc2VjcmV0LW5vdC1mb3ItcHJvZC1kby1ub3QtdXNlLTMyYnl0ZXM="
+      ONIFIED_RBAC_TOKEN_SECRET: "ZGV2LXJiYWMtdG9rZW4tc2VjcmV0LTMyLWJ5dGVzISE="
+      ONIFIED_CRYPTO_MASTER_KEY: "ZGV2LWFlczI1Ni1tYXN0ZXIta2V5LW5vdC1mb3ItcHJvZC0xMjM0NTY3OA=="
+      ONIFIED_RBAC_JWT_ISSUER: onified-gateway
+      # ── JWT signing: RS256 (DEV ONLY keypair) ─────────────────────────────
+      # G12-R08/R09 forbid HS256 for issued tokens; rbac-library 3.2.7 dropped
+      # HS256 verification entirely. Public key is also self-trusted here so
+      # iam can verify its own RS256 tokens on its own protected endpoints.
+      SECURITY_JWT_ALGORITHM: "RS256"
+      SECURITY_JWT_PRIVATE_KEY: "MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDZspcSKIP7+pmt8xElQZWyeP/mYEuv6B0lmmZUnheoNpjHuLn1X0QxY34O/MBrTxBoKAZt8ZNAJUjorGOXVyvsY88inRfOZknq8BueRdkESLJ/ANejtrgSc4bOLQHj3fPJiu78I1t0y9LguM2aStTFvfbNtUeFfhmfnUyXRSK+TfqwEjJqY0AAis/MbcuB1HWptnOpz59YOe4AQjNiEL4SYgaKYL546Azg3O0r1T/t+poXRUODFerVHiyvHimKancBpt2LCQ11gSyU5zuBj7fPn5cAp9qQ/vKtY/qfmF1x5Xnd/AJqQX2Aury71p18GRl+AxBTbzl2G8ExbPTOBzCTAgMBAAECggEAXiFQHDxjkWVS5PmobL0WjuSt9b2mjGmnjLZdz/HJ1eTBm/4+fiASuu5DuBRG2T+HHxpLaWee3Yoho+XCbFJ3fg/MJTHa9Naa2Ji4wG+APk92yt6g3zunDOdiHy0r140FmBxYaLKbHX3ycVPHJxN7PAN/P4RGaCzVxIP99ZyhwLnnwDPose8E+XhlbLQVQUlxCy6X0lWI6o/ACidZbekBIN6IFoNUrZ3MVvtjQQND1ZyRv5ySZ/hgB7M7ADGSp7vP1iu/NdK6dD+yElvbzJrYTMnVeZ+OxH0CMy9fFFa10GZSJEhhRtD3edUqLmw/7BAP5zfEeA+pAU8+cyoVlOov6QKBgQD1arXNJlw7ilOQlUq4eu32YjWZI4QK0S4eOXilShQCx4qfvunzvJN/PGX24e0HQyGiNgC/IkC1KjXSl25RjSL4Z/DZL/VrrZSTkORc+DE2KHdYRuJHQsX2+ByXRggG1j9GZ0XiXq5FD9lMw84oaKe6UPhmBhZ8FUxuYkk1BzZwCwKBgQDjFd9YBNLn5FdM5qPJP2trgwpa5LS7uHOOiLmYhozOEOoHq9Y76w3eD23nRCANeiMjblpLFsdljlSxyAnL2E7dmOWuaRbDpR1v3GcEtb9JxtQ+rSaqF+PLtqNIoUgn0fJX61pwXUtMZhaY/cd9r+AJxVSHn05eQDMS/VEC93zumQKBgHAlf0ZsDSG4KE+dqTN8GVnJryx3qlM3G5f8M0F1BIfwn0w4dbhHqC8wbnfO7f2vk6MIgnbVNDSVQVsmj+b8U8qn1Muqur+l5os4XuKNGA/jlgXk/moJ/WTKJGaMPgbByNBnSOwU0BYHFAmcQIz+pgbiEWCtz4CMSwz2JPXygdHZAoGAKSLtMqStEBTtO6EMSoiSjQdP+Oc1Vkwzor5h4J9/IlUuD/Ww+Wm7OV7SKfLNW6OkeeajtLaLqHoAHbR/Ec49eycXdGDVHtvqWTkz8EZ8QIEkMbZsKqPpQB31tlKBH7WIkSSxXWmJGm3j6hMO8FXL3/k/NtJFAA3hMq9w3Xi3yQECgYB5QbEgGzlWpsGw/R5Kh3K8Ns2e/c6AhpVbsZzNrl/uPb1Ezi1NSprv4gxbXExWPBDHbNcHp2SAAVEFQv1rBskj2VrE+fhMM/YCeKkKlQMyNrPZUm/5HCKFkGqxPJ+AFEj/jVK6dBfICohxhoI0nRI5aufDZb6v25icbsyRwlhGjw=="
+      SECURITY_JWT_PUBLIC_KEY: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2bKXEiiD+/qZrfMRJUGVsnj/5mBLr+gdJZpmVJ4XqDaYx7i59V9EMWN+DvzAa08QaCgGbfGTQCVI6Kxjl1cr7GPPIp0XzmZJ6vAbnkXZBEiyfwDXo7a4EnOGzi0B493zyYru/CNbdMvS4LjNmkrUxb32zbVHhX4Zn51Ml0Uivk36sBIyamNAAIrPzG3LgdR1qbZzqc+fWDnuAEIzYhC+EmIGimC+eOgM4NztK9U/7fqaF0VDgxXq1R4srx4pimp3AabdiwkNdYEslOc7gY+3z5+XAKfakP7yrWP6n5hdceV53fwCakF9gLq8u9adfBkZfgMQU285dhvBMWz0zgcwkwIDAQAB"
+      ONIFIED_RBAC_RS256_TRUSTED_PUBLIC_KEYS: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2bKXEiiD+/qZrfMRJUGVsnj/5mBLr+gdJZpmVJ4XqDaYx7i59V9EMWN+DvzAa08QaCgGbfGTQCVI6Kxjl1cr7GPPIp0XzmZJ6vAbnkXZBEiyfwDXo7a4EnOGzi0B493zyYru/CNbdMvS4LjNmkrUxb32zbVHhX4Zn51Ml0Uivk36sBIyamNAAIrPzG3LgdR1qbZzqc+fWDnuAEIzYhC+EmIGimC+eOgM4NztK9U/7fqaF0VDgxXq1R4srx4pimp3AabdiwkNdYEslOc7gY+3z5+XAKfakP7yrWP6n5hdceV53fwCakF9gLq8u9adfBkZfgMQU285dhvBMWz0zgcwkwIDAQAB"
+      # ── L2 tenant-host binding ────────────────────────────────────────────
+      ONIFIED_TENANT_HOST_BINDING_ENFORCE: "false"
+      # ── Heap override (matches Dockerfile default) ────────────────────────
+      HEAP: "1g"
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka:    { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    # Host port mapping (see onified-ports.md). Bound to 127.0.0.1 so the
+    # service is reachable from this machine for dev/curl but is NOT
+    # published to the LAN — every block below carries dev-only secrets and
+    # no direct-access auth perimeter. Normal traffic still goes via internal-gateway.
+    ports:
+      - "127.0.0.1:8082:8082"
+      - "127.0.0.1:8500:8500"
+    deploy:
+      resources:
+        limits:
+          memory: 1.75g
+          cpus: '1.5'
+        reservations:
+          memory: 1g
+          cpus: '0.25'
+    networks:
+      - default
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # CONTENT  (port: 8081)            tier: 1 — file storage
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Role:       Document + template storage. Uses Vault for per-tenant S3 creds.
+  # Calls:      iam (constraint fetch), vault.
+  # Called by:  iam (avatar uploads), notification (template attachments),
+  #             work-management (ticket attachments), platform-data (file refs).
+  # If commented out: file uploads/downloads fail. RBAC + tickets still work.
+  # ───────────────────────────────────────────────────────────────────────────
+  content:
+    container_name: onified-content
+    image: onified/content:dev
+    restart: unless-stopped
+    build:
+      context: ..
+      dockerfile: services/platform/content/Dockerfile.local-dev
+      secrets:
+        - source: gitlab_user
+        - source: gitlab_token
+    environment:
+      # ── Profile + DB ──────────────────────────────────────────────────────
+      SPRING_PROFILES_ACTIVE: local
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/onified_beta_local?currentSchema=content
+      DB_SCHEMA: content
+      SPRING_JPA_HIBERNATE_DDL_AUTO: update
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: "Thekapilg"
+      SPRING_FLYWAY_ENABLED: "false"
+      SPRING_FLYWAY_URL: jdbc:postgresql://postgres:5432/onified_beta_local?currentSchema=content
+      SPRING_FLYWAY_USER: postgres
+      SPRING_FLYWAY_PASSWORD: "Thekapilg"
+      SPRING_FLYWAY_SCHEMAS: content
+      SPRING_FLYWAY_PLACEHOLDERS_DB_SCHEMA: content
+      # ── Kafka / Redis ─────────────────────────────────────────────────────
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: "6379"
+      # ── Cross-service URLs ────────────────────────────────────────────────
+      ONIFIED_RBAC_CONSTRAINT_FETCH_URL: http://iam:8082/internal/v1/constraints/fetch
+      # Without this, DefaultAuthorityPolicyLoader falls back to its
+      # http://localhost:8082 default, which inside this container resolves
+      # to content's own loopback (not iam) — the policy cache warm-up
+      # then fails with "Connection refused" and every @PreAuthorize check
+      # denies by default (confirmed: blanket 403 ACCESS_DENIED on every
+      # protected endpoint regardless of the caller's actual authorities).
+      ONIFIED_RBAC_USER_MANAGEMENT_URL: http://iam:8082
+      ONIFIED_RBAC_RS256_TRUSTED_PUBLIC_KEYS: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2bKXEiiD+/qZrfMRJUGVsnj/5mBLr+gdJZpmVJ4XqDaYx7i59V9EMWN+DvzAa08QaCgGbfGTQCVI6Kxjl1cr7GPPIp0XzmZJ6vAbnkXZBEiyfwDXo7a4EnOGzi0B493zyYru/CNbdMvS4LjNmkrUxb32zbVHhX4Zn51Ml0Uivk36sBIyamNAAIrPzG3LgdR1qbZzqc+fWDnuAEIzYhC+EmIGimC+eOgM4NztK9U/7fqaF0VDgxXq1R4srx4pimp3AabdiwkNdYEslOc7gY+3z5+XAKfakP7yrWP6n5hdceV53fwCakF9gLq8u9adfBkZfgMQU285dhvBMWz0zgcwkwIDAQAB"
+      # ── Vault (per-tenant S3 creds) ───────────────────────────────────────
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN: root
+      # ── Logging SDK ───────────────────────────────────────────────────────
+      LOGGING_SDK_BOOTSTRAP_SERVERS: kafka:29092
+      LOGGING_SDK_OTEL_ENABLED: "false"
+      # ── gRPC server (DocumentService inbound, called by iam/integration/
+      # work-management) ─────────────────────────────────────────────────────
+      GRPC_SERVER_PORT: "8501"
+      # ── Auth secrets (DEV ONLY) ───────────────────────────────────────────
+      ONIFIED_JWT_SECRET_KEY: "ZGV2LW9ubHktc2VjcmV0LW5vdC1mb3ItcHJvZC1kby1ub3QtdXNlLTMyYnl0ZXM="
+      ONIFIED_RBAC_TOKEN_SECRET: "ZGV2LXJiYWMtdG9rZW4tc2VjcmV0LTMyLWJ5dGVzISE="
+      # ── L4 tenant-host binding ────────────────────────────────────────────
+      ONIFIED_RBAC_TENANT_HOST_BINDING_ENFORCE: "false"
+      # ── Heap override (matches Dockerfile default) ────────────────────────
+      HEAP: "768m"
+    depends_on:
+      postgres:   { condition: service_healthy }
+      kafka:      { condition: service_healthy }
+      redis:      { condition: service_healthy }
+      vault-seed: { condition: service_completed_successfully }
+    # Host port mapping (see onified-ports.md). Bound to 127.0.0.1 so the
+    # service is reachable from this machine for dev/curl but is NOT
+    # published to the LAN — every block below carries dev-only secrets and
+    # no direct-access auth perimeter. Normal traffic still goes via internal-gateway.
+    ports:
+      - "127.0.0.1:8081:8081"
+      - "127.0.0.1:8501:8501"
+    deploy:
+      resources:
+        limits:
+          memory: 1.25g
+          cpus: '1.0'
+        reservations:
+          memory: 768m
+          cpus: '0.25'
+    networks:
+      - default
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # PLATFORM-DATA  (port: 8085)      tier: 1 — registries
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Role:       Table/field/service registries, Country, ApprovalActorType,
+  #             OuUnitType. Outbox writer for Elasticsearch indexing.
+  # Calls:      iam (constraint fetch), content (file references).
+  # Called by:  workflow (approval-actor-types), analytics (source validation
+  #             — commented out today), internal-gateway (routing target).
+  # If commented out: workflow approval setup breaks. Most other things fine.
+  # ───────────────────────────────────────────────────────────────────────────
+  platform-data:
+    container_name: onified-platform-data
+    image: onified/platform-data:dev
+    restart: unless-stopped
+    build:
+      context: ..
+      dockerfile: services/platform/platform-data/Dockerfile.local-dev-jar
+      secrets:
+        - source: gitlab_user
+        - source: gitlab_token
+    environment:
+      # ── Profile + DB ──────────────────────────────────────────────────────
+      SPRING_PROFILES_ACTIVE: local
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/onified_beta_local?currentSchema=platform_data
+      DB_SCHEMA: platform_data
+      # SPRING_JPA_HIBERNATE_DDL_AUTO: update
+      SPRING_JPA_HIBERNATE_DDL_AUTO: update
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: "Thekapilg"
+      # Switched to Hibernate ddl-auto=update locally instead of Flyway — platform-data
+      # has no RLS/tenant-isolation SQL in its migrations (verified), so this is safe
+      # for this service specifically. Flyway migrations here predate a fresh-DB run
+      # ever being attempted and have real bugs (V01 parser issue, already fixed
+      # separately) that keep surfacing one at a time; this unblocks local dev without
+      # touching beta/prod (both still use Flyway with ddl-auto=validate).
+      SPRING_FLYWAY_ENABLED: "false"
+      # ── Kafka / Redis ─────────────────────────────────────────────────────
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: "6379"
+      # ── Cross-service URLs ────────────────────────────────────────────────
+      ONIFIED_RBAC_CONSTRAINT_FETCH_URL: http://iam:8082/internal/v1/constraints/fetch
+      # ServiceAccountTokenProvider.java binds this exact name — was unset before,
+      # so platform-data's own S2S token mint to iam always failed.
+      ONIFIED_RBAC_USER_MANAGEMENT_URL: http://iam:8082
+      FILE_STORAGE_SERVICE_URL: http://content:8081
+      # Was unset — IntegrationServiceClient defaulted to http://localhost:8090, which inside
+      # this container means itself, not the integration service. Broke resolveRegistry/execute
+      # for the whole verification flow (pre-existing, unrelated to any single code change).
+      INTEGRATION_INTERNAL_URL: http://integration:8090
+      # Code default is the hyphenated "ONIFIED_PLATFORM_BETA-ADMIN", but the actual platform-scoped
+      # role seeded in the beta dump (iam.role_definitions, tenant_id NULL) is spelled with an
+      # underscore. Real beta deployments must override this env var too; only the local default
+      # here was missing it. Without this, ServiceAccountTokenProvider can never mint a token.
+      SERVICE_ACCOUNT_ROLE: ONIFIED_PLATFORM_BETA_ADMIN
+      # Were unset (both defaulted to blank in application-local.yaml) — ServiceAccountTokenProvider
+      # was minting a token request with username="" password="", which iam accepted once and
+      # then rejected on every retry with a user_name='' unique-constraint conflict. Dev-only.
+      SERVICE_ACCOUNT_USERNAME: svc_platform_data_service
+      SERVICE_ACCOUNT_PASSWORD: "dev-throwaway-password"
+      # ── Logging SDK ───────────────────────────────────────────────────────
+      LOGGING_SDK_BOOTSTRAP_SERVERS: kafka:29092
+      LOGGING_SDK_OTEL_ENABLED: "false"
+      # ── gRPC server (EntityRegistry/ServiceRegistry/MetadataCatalog inbound) + s2s
+      # client to iam (TenantIdResolverGrpcGateway, target key "iam-service").
+      GRPC_SERVER_PORT: "8502"
+      IDENTITY_GRPC_PORT: "8500"
+      # ── Auth secrets (DEV ONLY) ───────────────────────────────────────────
+      ONIFIED_JWT_SECRET_KEY: "ZGV2LW9ubHktc2VjcmV0LW5vdC1mb3ItcHJvZC1kby1ub3QtdXNlLTMyYnl0ZXM="
+      ONIFIED_RBAC_TOKEN_SECRET: "ZGV2LXJiYWMtdG9rZW4tc2VjcmV0LTMyLWJ5dGVzISE="
+      # Was missing entirely — RbacJwtUtil logged "ZERO trusted RS256 keys, ALL
+      # tokens will be rejected" without it. Same key every other service trusts.
+      ONIFIED_RBAC_RS256_TRUSTED_PUBLIC_KEYS: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2bKXEiiD+/qZrfMRJUGVsnj/5mBLr+gdJZpmVJ4XqDaYx7i59V9EMWN+DvzAa08QaCgGbfGTQCVI6Kxjl1cr7GPPIp0XzmZJ6vAbnkXZBEiyfwDXo7a4EnOGzi0B493zyYru/CNbdMvS4LjNmkrUxb32zbVHhX4Zn51Ml0Uivk36sBIyamNAAIrPzG3LgdR1qbZzqc+fWDnuAEIzYhC+EmIGimC+eOgM4NztK9U/7fqaF0VDgxXq1R4srx4pimp3AabdiwkNdYEslOc7gY+3z5+XAKfakP7yrWP6n5hdceV53fwCakF9gLq8u9adfBkZfgMQU285dhvBMWz0zgcwkwIDAQAB"
+      # ── L4 tenant-host binding ────────────────────────────────────────────
+      ONIFIED_RBAC_TENANT_HOST_BINDING_ENFORCE: "false"
+      # ── Heap override (matches Dockerfile default) ────────────────────────
+      HEAP: "768m"
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka:    { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    # Host port mapping (see onified-ports.md). Bound to 127.0.0.1 so the
+    # service is reachable from this machine for dev/curl but is NOT
+    # published to the LAN — every block below carries dev-only secrets and
+    # no direct-access auth perimeter. Normal traffic still goes via internal-gateway.
+    ports:
+      - "127.0.0.1:8085:8085"
+      - "127.0.0.1:8502:8502"
+    deploy:
+      resources:
+        limits:
+          memory: 1.25g
+          cpus: '1.0'
+        reservations:
+          memory: 768m
+          cpus: '0.25'
+    networks:
+      - default
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # MASTER-DATA  (port: 8086)        tier: 1 — reference data
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Role:       59 Master* reference entities (Grade, Warehouse, Employee,
+  #             Vendor, Vehicle, Position, Material, …).
+  # Calls:      iam (constraint fetch), vault.
+  # Called by:  workflow (master lookups), internal-gateway (routing target).
+  # If commented out: workflow master-data lookups fail.
+  # ───────────────────────────────────────────────────────────────────────────
+  master-data:
+    container_name: onified-master-data
+    image: onified/master-data:dev
+    restart: unless-stopped
+    build:
+      context: ..
+      dockerfile: services/apps/master-data/Dockerfile.local-dev-jar
+      secrets:
+        - source: gitlab_user
+        - source: gitlab_token
+    environment:
+      # ── Profile + DB ──────────────────────────────────────────────────────
+      SPRING_PROFILES_ACTIVE: local
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/onified_beta_local
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: "Thekapilg"
+      # ── Kafka / Redis ─────────────────────────────────────────────────────
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      # TenantLifecycleKafkaConfig/PartnerRelationshipConsumer read
+      # spring.kafka.bootstrap-servers directly (not KAFKA_BOOTSTRAP_SERVERS,
+      # which nothing in master-data binds to) — without this they default to
+      # localhost:9092 and the consumers never connect inside the container.
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: "6379"
+      # ── Cross-service URLs ────────────────────────────────────────────────
+      ONIFIED_RBAC_CONSTRAINT_FETCH_URL: http://iam:8082/internal/v1/constraints/fetch
+      # PlatformDataClient.java binds this exact name — was unset before, so
+      # master-data's own vehicle-type lookups against platform-data always
+      # fell back to localhost inside the container.
+      ONIFIED_PLATFORMDATA_BASE_URL: http://platform-data:8085
+      # Required so the rbac-library's AuthorityPolicyLoader bean gets created (same
+      # crash class as workflow's earlier fix) — without it master-data crash-loops.
+      ONIFIED_RBAC_USER_MANAGEMENT_URL: http://iam:8082
+      ONIFIED_RBAC_RS256_TRUSTED_PUBLIC_KEYS: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2bKXEiiD+/qZrfMRJUGVsnj/5mBLr+gdJZpmVJ4XqDaYx7i59V9EMWN+DvzAa08QaCgGbfGTQCVI6Kxjl1cr7GPPIp0XzmZJ6vAbnkXZBEiyfwDXo7a4EnOGzi0B493zyYru/CNbdMvS4LjNmkrUxb32zbVHhX4Zn51Ml0Uivk36sBIyamNAAIrPzG3LgdR1qbZzqc+fWDnuAEIzYhC+EmIGimC+eOgM4NztK9U/7fqaF0VDgxXq1R4srx4pimp3AabdiwkNdYEslOc7gY+3z5+XAKfakP7yrWP6n5hdceV53fwCakF9gLq8u9adfBkZfgMQU285dhvBMWz0zgcwkwIDAQAB"
+      # ── Vault ─────────────────────────────────────────────────────────────
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN: root
+      # Required, no default — master-data's own vault-tenant secret path.
+      VAULT_SECRET_PATH: "kv/master-data-service/db_cred"
+      # master-data's TenantRoutingDataSource doesn't fetch DB creds from Vault
+      # directly at query time — it goes through secret-proxy (vault-tenant-core's
+      # SecretProxyClientImpl), which defaults to localhost:9100 (wrong inside a
+      # container, and secret-proxy wasn't even running). Confirmed via a real
+      # 500 on POST /api/v1/master/customers: "ProxyUnavailableException:
+      # secret-proxy I/O failure after retries". Requires the secret-proxy
+      # overlay (docker-compose.secret-proxy.yml) to actually be running.
+      # Port 8200 is secret-proxy's real HTTP/REST API — its OWN 8201 is a
+      # separate raw TCP tunnel (confirmed via its own boot log), not HTTP;
+      # pointing here first got "parsing HTTP/1.1 status line" garbage-byte
+      # errors, not a clean connection failure.
+      SECRET_PROXY_BASE_URL: http://secret-proxy:8200
+      # ── Logging SDK ───────────────────────────────────────────────────────
+      LOGGING_SDK_BOOTSTRAP_SERVERS: kafka:29092
+      LOGGING_SDK_OTEL_ENABLED: "false"
+      # ── gRPC server (inbound) + s2s client to billing-subscription
+      # (EntitlementGrpcGateway, target key "billing-subscription-service").
+      GRPC_SERVER_PORT: "8508"
+      BILLING_GRPC_PORT: "8503"
+      # ── Auth secrets (DEV ONLY) ───────────────────────────────────────────
+      ONIFIED_JWT_SECRET_KEY: "ZGV2LW9ubHktc2VjcmV0LW5vdC1mb3ItcHJvZC1kby1ub3QtdXNlLTMyYnl0ZXM="
+      ONIFIED_RBAC_TOKEN_SECRET: "ZGV2LXJiYWMtdG9rZW4tc2VjcmV0LTMyLWJ5dGVzISE="
+      # Required directly by rbac-library's PartnerRelationshipConsumer (raw @Value on the env var
+      # name itself, no property-path default) — without it master-data crash-loops on boot.
+      # Same dev-only value as application.yml's (base) internal-jwt-secret default.
+      ONIFIED_RBAC_INTERNAL_JWT_SECRET: "ad5581d9fb20ed04a3f5a9f4eeb9f6e99cfca9e838742b230e1ee159935ed538"
+      # ── L4 tenant-host binding ────────────────────────────────────────────
+      ONIFIED_RBAC_TENANT_HOST_BINDING_ENFORCE: "false"
+      # ── Heap override (matches Dockerfile default) ────────────────────────
+      HEAP: "768m"
+      # ── Schema management ─────────────────────────────────────────────────
+      SPRING_FLYWAY_ENABLED: "false"
+      SPRING_JPA_HIBERNATE_DDL_AUTO: update
+    depends_on:
+      postgres:   { condition: service_healthy }
+      kafka:      { condition: service_healthy }
+      redis:      { condition: service_healthy }
+      vault-seed: { condition: service_completed_successfully }
+      secret-proxy: { condition: service_started }
+    # Host port mapping (see onified-ports.md). Bound to 127.0.0.1 so the
+    # service is reachable from this machine for dev/curl but is NOT
+    # published to the LAN — every block below carries dev-only secrets and
+    # no direct-access auth perimeter. Normal traffic still goes via internal-gateway.
+    ports:
+      - "127.0.0.1:8086:8086"
+      - "127.0.0.1:8508:8508"
+    deploy:
+      resources:
+        limits:
+          memory: 1.25g
+          cpus: '1.0'
+        reservations:
+          memory: 768m
+          cpus: '0.25'
+    networks:
+      - default
+  # ═══════════════════════════════════════════════════════════════════════════
+  # ANALYTICS  (port: 8087)          tier: 2 — analytics
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Role:       Pure PostgreSQL analytics dashboards + Redis pub/sub for
+
+  #             cache invalidation. No Kafka consumers.
+  # Calls:      iam (commented out today — source validation disabled),
+  #             platform-data (commented out today).
+  # Called by:  internal-gateway (routing target).
+  # If commented out: analytics dashboards unavailable. Nothing else breaks.
+  # ───────────────────────────────────────────────────────────────────────────
+  analytics:
+    container_name: onified-analytics
+    image: onified/analytics:dev
+    restart: unless-stopped
+    build:
+      context: ..
+      dockerfile: services/platform/analytics/Dockerfile.local-dev
+      secrets:
+        - source: gitlab_user
+        - source: gitlab_token
+    environment:
+      # ── Profile + DB ──────────────────────────────────────────────────────
+      SPRING_PROFILES_ACTIVE: local
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/onified_beta_local?currentSchema=analytics
+      DB_SCHEMA: analytics
+      SPRING_JPA_HIBERNATE_DDL_AUTO: update
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: "Thekapilg"
+      # Fresh local volume has no schema; loc\l yml disables flyway assuming a
+      # beta dump was restored (same fix already applied to internal-gateway/iam/content/geo).
+      SPRING_FLYWAY_ENABLED: "false"
+      
+      # Required so the rbac-library's AuthorityPolicyLoader bean gets created (same
+      # crash class as workflow/master-data's earlier fix) — without it, crash-loops.
+      ONIFIED_RBAC_USER_MANAGEMENT_URL: http://iam:8082
+      # ── Kafka / Redis (Redis is the primary integration here) ─────────────
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: "6379"
+      # SPRING_DATA_REDIS_HOST/PORT above are dead — analytics' own yml wrapsone n
+      # spring.data.redis.host/port in a NESTED ${REDIS_HOST:localhost} 
+      # ${REDIS_PORT:6379} placeholder, so only these exact names are read.
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      # ── Logging SDK ───────────────────────────────────────────────────────
+      LOGGING_SDK_BOOTSTRAP_SERVERS: kafka:29092
+      LOGGING_SDK_OTEL_ENABLED: "false"
+      # ── gRPC server (inbound) + s2s client to billing-subscription
+      # (EntitlementGrpcGateway, target key "billing-subscription-service").
+      GRPC_SERVER_PORT: "8509"
+      BILLING_GRPC_PORT: "8503"
+      # ── Auth secrets (DEV ONLY) ───────────────────────────────────────────
+      ONIFIED_JWT_SECRET_KEY: "ZGV2LW9ubHktc2VjcmV0LW5vdC1mb3ItcHJvZC1kby1ub3QtdXNlLTMyYnl0ZXM="
+      ONIFIED_RBAC_TOKEN_SECRET: "ZGV2LXJiYWMtdG9rZW4tc2VjcmV0LTMyLWJ5dGVzISE="
+      ONIFIED_RBAC_RS256_TRUSTED_PUBLIC_KEYS: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2bKXEiiD+/qZrfMRJUGVsnj/5mBLr+gdJZpmVJ4XqDaYx7i59V9EMWN+DvzAa08QaCgGbfGTQCVI6Kxjl1cr7GPPIp0XzmZJ6vAbnkXZBEiyfwDXo7a4EnOGzi0B493zyYru/CNbdMvS4LjNmkrUxb32zbVHhX4Zn51Ml0Uivk36sBIyamNAAIrPzG3LgdR1qbZzqc+fWDnuAEIzYhC+EmIGimC+eOgM4NztK9U/7fqaF0VDgxXq1R4srx4pimp3AabdiwkNdYEslOc7gY+3z5+XAKfakP7yrWP6n5hdceV53fwCakF9gLq8u9adfBkZfgMQU285dhvBMWz0zgcwkwIDAQAB"
+      # ── L4 tenant-host binding ────────────────────────────────────────────
+      ONIFIED_RBAC_TENANT_HOST_BINDING_ENFORCE: "false"
+      # ── Heap override (matches Dockerfile default) ────────────────────────
+      # Prod defaults to 8g for large analytical scans; reduced here for local dev.
+      HEAP: "768m"
+      # Overrides the Dockerfile's baked-in JAVA_OPTS (env var wins over image ENV
+      # default) — identical except -XX:+AlwaysPreTouch -> -XX:-AlwaysPreTouch.
+      # AlwaysPreTouch forces the JVM to commit its ENTIRE heap synchronously at
+      # startup instead of growing into it lazily; on a host this memory-tight,
+      # that upfront all-or-nothing demand is what's actually triggering the
+      # OOM kill within seconds, before the app logs a single line.
+      JAVA_OPTS: >-
+        -server
+        -Xms768m -Xmx768m
+        -XX:-AlwaysPreTouch
+        -XX:+UseContainerSupport
+        -XX:InitialRAMPercentage=80.0
+        -XX:MaxRAMPercentage=80.0
+        -XX:+UseG1GC
+        -XX:MaxGCPauseMillis=200
+        -XX:InitiatingHeapOccupancyPercent=35
+        -XX:+UseStringDeduplication
+        -XX:+ParallelRefProcEnabled
+        -XX:MetaspaceSize=128m
+        -XX:MaxMetaspaceSize=512m
+        -XX:CompressedClassSpaceSize=128m
+        -XX:MaxDirectMemorySize=512m
+        -XX:ReservedCodeCacheSize=256m
+        -XX:+UseCodeCacheFlushing
+        -Xss512k
+        -XX:+ExitOnOutOfMemoryError
+        -XX:+HeapDumpOnOutOfMemoryError
+        -XX:HeapDumpPath=/var/log/heapdumps/
+        -XX:ErrorFile=/var/log/jvm/hs_err_pid%p.log
+        -Djava.net.preferIPv4Stack=true
+        -Dfile.encoding=UTF-8
+        -Duser.timezone=UTC
+        -Dspring.jmx.enabled=false
+        -Djava.security.egd=file:/dev/./urandom
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka:    { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    # Host port mapping (see onified-ports.md). Bound to 127.0.0.1 so the
+    # service is reachable from this machine for dev/curl but is NOT
+    # published to the LAN — every block below carries dev-only secrets and
+    # no direct-access auth perimeter. Normal traffic still goes via internal-gateway.
+    ports:
+      - "127.0.0.1:8087:8087"
+      - "127.0.0.1:8509:8509"
+    # Uncapping this entirely (tried once) let the container try to grab memory
+    # the host doesn't have, and destabilized Docker's engine itself rather than
+    # helping analytics boot. Reverted to a bounded, generous limit.
+    deploy:
+      resources:
+        limits:
+          memory: 2.5g
+          cpus: '1.0'
+        reservations:
+          memory: 1.5g
+          cpus: '0.25'
+    networks:
+      - default
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # BILLING-SUBSCRIPTION  (port: 8084)   tier: 2 — billing
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Role:       Plans, plan-versions, addons, subscriptions, invoices,
+  #             payments, coupons, usage events. Kafka producer for
+  #             onified.billing.plan-events and billing-usage-updates.
+  # Calls:      iam (RestClient for app + tenant metadata, cached).
+  # Called by:  governance (plan events consumer), internal-gateway (routing target).
+  # If commented out: billing/subscription admin breaks. RBAC still works.
+  # ───────────────────────────────────────────────────────────────────────────
+  billing-subscription:
+    container_name: onified-billing
+    image: onified/billing-subscription:dev
+    restart: unless-stopped
+    build:
+      context: ..
+      dockerfile: services/platform/billing-subscription/Dockerfile.local-dev
+      secrets:
+        - source: gitlab_user
+        - source: gitlab_token
+    environment:
+      # ── Profile + DB ──────────────────────────────────────────────────────
+      SPRING_PROFILES_ACTIVE: local
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/onified_beta_local?currentSchema=billing_subscription
+      DB_SCHEMA: billing_subscription
+      SPRING_FLYWAY_ENABLED: "false"
+      SPRING_JPA_HIBERNATE_DDL_AUTO: update
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: "Thekapilg"
+      # ── Kafka / Redis ─────────────────────────────────────────────────────
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: "6379"
+      # ── Cross-service URLs ────────────────────────────────────────────────
+      BILLING_IDENTITY_SERVICE_BASE_URL: http://iam:8082
+      ONIFIED_RBAC_CONSTRAINT_FETCH_URL: http://iam:8082/internal/v1/constraints/fetch
+      # Same AuthorityPolicyLoader crash as workflow — see that block's comment.
+      ONIFIED_RBAC_USER_MANAGEMENT_URL: http://iam:8082
+      ONIFIED_RBAC_RS256_TRUSTED_PUBLIC_KEYS: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2bKXEiiD+/qZrfMRJUGVsnj/5mBLr+gdJZpmVJ4XqDaYx7i59V9EMWN+DvzAa08QaCgGbfGTQCVI6Kxjl1cr7GPPIp0XzmZJ6vAbnkXZBEiyfwDXo7a4EnOGzi0B493zyYru/CNbdMvS4LjNmkrUxb32zbVHhX4Zn51Ml0Uivk36sBIyamNAAIrPzG3LgdR1qbZzqc+fWDnuAEIzYhC+EmIGimC+eOgM4NztK9U/7fqaF0VDgxXq1R4srx4pimp3AabdiwkNdYEslOc7gY+3z5+XAKfakP7yrWP6n5hdceV53fwCakF9gLq8u9adfBkZfgMQU285dhvBMWz0zgcwkwIDAQAB"
+      # ── Logging SDK ───────────────────────────────────────────────────────
+      LOGGING_SDK_BOOTSTRAP_SERVERS: kafka:29092
+      LOGGING_SDK_OTEL_ENABLED: "false"
+      # ── gRPC server (RuntimeGateService inbound) + s2s client to governance
+      # (RuntimeGateGrpcGateway, target key "governance-service" — see application-local.yml).
+      GRPC_SERVER_PORT: "8503"
+      # ── Auth secrets (DEV ONLY) ───────────────────────────────────────────
+      ONIFIED_JWT_SECRET_KEY: "ZGV2LW9ubHktc2VjcmV0LW5vdC1mb3ItcHJvZC1kby1ub3QtdXNlLTMyYnl0ZXM="
+      ONIFIED_RBAC_TOKEN_SECRET: "ZGV2LXJiYWMtdG9rZW4tc2VjcmV0LTMyLWJ5dGVzISE="
+      # ── L4 tenant-host binding ────────────────────────────────────────────
+      ONIFIED_RBAC_TENANT_HOST_BINDING_ENFORCE: "false"
+      # ── Heap override (matches Dockerfile default) ────────────────────────
+      HEAP: "512m"
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka:    { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    # Host port mapping (see onified-ports.md). Bound to 127.0.0.1 so the
+    # service is reachable from this machine for dev/curl but is NOT
+    # published to the LAN — every block below carries dev-only secrets and
+    # no direct-access auth perimeter. Normal traffic still goes via internal-gateway.
+    ports:
+      - "127.0.0.1:8084:8084"
+      - "127.0.0.1:8503:8503"
+    deploy:
+      resources:
+        limits:
+          memory: 900m
+          cpus: '0.75'
+        reservations:
+          memory: 512m
+          cpus: '0.25'
+    networks:
+      - default
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # GOVERNANCE  (port: 8088)         tier: 2 — AI/API governance
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Role:       AI/API governance, consent, rate-limit policies, budget caps,
+  #             breach events, model-capability + provider-contract registry.
+  # Calls:      iam (token exchange, tenant metadata),
+  #             billing-subscription (plan state).
+  # Called by:  notification (rate-limit policy resolution), internal-gateway.
+  # If commented out: notification's rate-limit lookups fall back to defaults.
+  # ───────────────────────────────────────────────────────────────────────────
+  governance:
+    container_name: onified-governance
+    image: onified/governance:dev
+    restart: unless-stopped
+    build:
+      context: ..
+      dockerfile: services/platform/governance/Dockerfile.local-dev
+      secrets:
+        - source: gitlab_user
+        - source: gitlab_token
+    environment:
+      # ── Profile + DB ──────────────────────────────────────────────────────
+      SPRING_PROFILES_ACTIVE: local
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/onified_beta_local?currentSchema=governance
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: "Thekapilg"
+      # Re-enabling Flyway (was disabled in favor of Hibernate ddl-auto=update,
+      # which turned out to be non-deterministic here — repeated "check constraint
+      # already exists" crashes on a genuinely fresh schema, different table each
+      # restart). Testing against a real migration failure instead, on a clean
+      # schema (dropped 2026-08-02).
+      SPRING_FLYWAY_ENABLED: "false"
+      SPRING_JPA_HIBERNATE_DDL_AUTO: update
+      DB_SCHEMA: governance
+      # ── Kafka / Redis ─────────────────────────────────────────────────────
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: "6379"
+      # RedisConfig.java binds its own manual LettuceConnectionFactory to
+      # ${redis.host}/${redis.port} (legacy property names, NOT spring.data.redis.*)
+      # — without these, manifestCacheInvalidationListenerContainer falls back
+      # to localhost:6379 and fails to start (same class of bug as the RBAC URL
+      # below: real property name doesn't match what was assumed here).
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      # ── Cross-service URLs ────────────────────────────────────────────────
+      ONIFIED_RBAC_CONSTRAINT_FETCH_URL: http://iam:8082/internal/v1/constraints/fetch
+      # Was missing here (confirmed via content's identical bug) — without it,
+      # DefaultAuthorityPolicyLoader falls back to localhost:8082 (this
+      # container's own loopback) and every live @PreAuthorize denies by default.
+      ONIFIED_RBAC_USER_MANAGEMENT_URL: http://iam:8082
+      GOVERNANCE_IDENTITY_BASE_URL: http://iam:8082
+      GOVERNANCE_BILLING_BASE_URL: http://billing-subscription:8084
+      # GOVERNANCE_IDENTITY_BASE_URL/GOVERNANCE_BILLING_BASE_URL above don't match the
+      # property names governance's own config actually binds to — these are the real ones:
+      ONIFIED_USER_MANAGEMENT_URL: http://iam:8082
+      ONIFIED_BILLING_BASE_URL: http://billing-subscription:8084
+      # ── Logging SDK ───────────────────────────────────────────────────────
+      LOGGING_SDK_BOOTSTRAP_SERVERS: kafka:29092
+      LOGGING_SDK_OTEL_ENABLED: "false"
+      # Enable Kafka listeners locally (defaults false in prod)
+      KAFKA_LISTENERS_ENABLED: "true"
+      # ── gRPC server (RuntimeGateService inbound) + s2s client to iam
+      # (TenantParentChainGrpcGateway, target key "iam-service").
+      GRPC_SERVER_PORT: "8504"
+      IDENTITY_GRPC_PORT: "8500"
+      # ── Auth secrets (DEV ONLY) ───────────────────────────────────────────
+      ONIFIED_JWT_SECRET_KEY: "ZGV2LW9ubHktc2VjcmV0LW5vdC1mb3ItcHJvZC1kby1ub3QtdXNlLTMyYnl0ZXM="
+      ONIFIED_RBAC_TOKEN_SECRET: "ZGV2LXJiYWMtdG9rZW4tc2VjcmV0LTMyLWJ5dGVzISE="
+      ONIFIED_RBAC_RS256_TRUSTED_PUBLIC_KEYS: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2bKXEiiD+/qZrfMRJUGVsnj/5mBLr+gdJZpmVJ4XqDaYx7i59V9EMWN+DvzAa08QaCgGbfGTQCVI6Kxjl1cr7GPPIp0XzmZJ6vAbnkXZBEiyfwDXo7a4EnOGzi0B493zyYru/CNbdMvS4LjNmkrUxb32zbVHhX4Zn51Ml0Uivk36sBIyamNAAIrPzG3LgdR1qbZzqc+fWDnuAEIzYhC+EmIGimC+eOgM4NztK9U/7fqaF0VDgxXq1R4srx4pimp3AabdiwkNdYEslOc7gY+3z5+XAKfakP7yrWP6n5hdceV53fwCakF9gLq8u9adfBkZfgMQU285dhvBMWz0zgcwkwIDAQAB"
+      # ── L4 tenant-host binding ────────────────────────────────────────────
+      ONIFIED_RBAC_TENANT_HOST_BINDING_ENFORCE: "false"
+      # ── Heap override (matches Dockerfile default) ────────────────────────
+      HEAP: "512m"
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka:    { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    # Host port mapping (see onified-ports.md). Bound to 127.0.0.1 so the
+    # service is reachable from this machine for dev/curl but is NOT
+    # published to the LAN — every block below carries dev-only secrets and
+    # no direct-access auth perimeter. Normal traffic still goes via internal-gateway.
+    ports:
+      - "127.0.0.1:8088:8088"
+      - "127.0.0.1:8504:8504"
+    deploy:
+      resources:
+        limits:
+          memory: 900m
+          cpus: '0.75'
+        reservations:
+          memory: 512m
+          cpus: '0.25'
+    networks:
+      - default
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # NOTIFICATION  (port: 8089)       tier: 2 — fan-out
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Role:       Email/SMS/WhatsApp/Push/InApp delivery. Kafka consumer on
+  #             notification-service-topic (batch listener, concurrency 4).
+  # Calls:      content (template attachments), iam (constraint fetch),
+  #             governance (rate-limit policy), external APIs (WhatsApp,
+  #             Pinnacle SMS, Firebase, SMTP).
+  # Called by:  iam, work-management, workflow (via Kafka topic).
+  # If commented out: notification events queue up in Kafka; emails/SMS/push
+  #                   don't get delivered. Producers continue working.
+  # ───────────────────────────────────────────────────────────────────────────
+  notification:
+    container_name: onified-notification
+    image: onified/notification:dev
+    restart: unless-stopped
+    build:
+      context: ..
+      dockerfile: services/platform/notification/Dockerfile.local-dev
+      secrets:
+        - source: gitlab_user
+        - source: gitlab_token
+    environment:
+      # ── Profile + DB ──────────────────────────────────────────────────────
+      SPRING_PROFILES_ACTIVE: local
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/onified_beta_local?currentSchema=notification
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: "Thekapilg"
+      DB_SCHEMA: notification
+      SPRING_JPA_HIBERNATE_DDL_AUTO: update
+      # Switched to Hibernate ddl-auto=update locally — Flyway's V33 migration has a
+      # genuine SQL syntax error ("syntax error at or near FROM"). No RLS in this
+      # service's migrations (verified), so this is safe.
+      SPRING_FLYWAY_ENABLED: "false"
+      # Required, no defaults — app fails to boot without these (matches dev-env.sh's
+      # bootRun-mode convention for local mail credentials).
+      MAIL_USERNAME: "dev@onified.local"
+      MAIL_PASSWORD: "devpass"
+      MAIL_ADDRESS: "dev@onified.local"
+      # Required, no defaults — FirebaseConfig is an unconditional @Bean (no feature
+      # flag to disable push locally). This is a throwaway, self-generated PKCS#8 key
+      # that satisfies the SDK's init-time parsing only — it cannot actually
+      # authenticate with Google, so real push sends will fail at runtime, but the
+      # app boots. Real push testing needs a genuine Firebase service account key.
+      # Required, no defaults — S3Client is also an unconditional @Bean. Dev-only
+      # placeholder values; real S3 uploads will fail at runtime, but the app boots.
+      AWS_S3_BUCKET: "dev-notification-bucket"
+      AWS_REGION: "ap-south-1"
+      AWS_ACCESS_KEY: "dev-throwaway-access-key"
+      AWS_SECRET_KEY: "dev-throwaway-secret-key"
+      # Required, no defaults — same story: unconditional beans for SMS/WhatsApp
+      # providers. Dev-only placeholders; real sends will fail at runtime.
+      SMS_PINNACLE_URL: "https://sms.pinnacle.example.com/api"
+      SMS_PINNACLE_APIKEY: "dev-throwaway-apikey"
+      SMS_PINNACLE_ENTITY_ID: "dev-throwaway-entity-id"
+      WHATSAPP_API_URL: "https://whatsapp.example.com/api"
+      WHATSAPP_API_TOKEN: "dev-throwaway-token"
+      FIREBASE_PRIVATE_KEY_ID: "dev-throwaway-key-id"
+      # FIREBASE_PRIVATE_KEY intentionally NOT set here — the Dockerfile's own
+      # ENTRYPOINT self-generates a fresh throwaway one at container startup
+      # if it's absent. No secret value lives in any tracked file at all.
+      # ── Kafka / Redis ─────────────────────────────────────────────────────
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: "6379"
+      # ── Cross-service URLs ────────────────────────────────────────────────
+      ONIFIED_RBAC_CONSTRAINT_FETCH_URL: http://iam:8082/internal/v1/constraints/fetch
+      ONIFIED_RBAC_USER_MANAGEMENT_URL: http://iam:8082
+      FILE_STORAGE_SERVICE_URL: http://content:8081
+      RATE_LIMIT_GOVERNANCE_URL: http://governance:8088
+      # Required, no default anywhere in notification's own yml (shared property
+      # convention, same as governance's) — NotificationMeteringService needs it.
+      ONIFIED_BILLING_BASE_URL: http://billing-subscription:8084
+      # ── Logging SDK ───────────────────────────────────────────────────────
+      LOGGING_SDK_BOOTSTRAP_SERVERS: kafka:29092
+      LOGGING_SDK_OTEL_ENABLED: "false"
+      # ── gRPC server (inbound) + s2s client to iam
+      # (BootstrapCacheGrpcGateway, target key "iam-service").
+      GRPC_SERVER_PORT: "8505"
+      IDENTITY_GRPC_PORT: "8500"
+      # ── Auth secrets (DEV ONLY) ───────────────────────────────────────────
+      ONIFIED_JWT_SECRET_KEY: "ZGV2LW9ubHktc2VjcmV0LW5vdC1mb3ItcHJvZC1kby1ub3QtdXNlLTMyYnl0ZXM="
+      ONIFIED_RBAC_TOKEN_SECRET: "ZGV2LXJiYWMtdG9rZW4tc2VjcmV0LTMyLWJ5dGVzISE="
+      ONIFIED_RBAC_RS256_TRUSTED_PUBLIC_KEYS: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2bKXEiiD+/qZrfMRJUGVsnj/5mBLr+gdJZpmVJ4XqDaYx7i59V9EMWN+DvzAa08QaCgGbfGTQCVI6Kxjl1cr7GPPIp0XzmZJ6vAbnkXZBEiyfwDXo7a4EnOGzi0B493zyYru/CNbdMvS4LjNmkrUxb32zbVHhX4Zn51Ml0Uivk36sBIyamNAAIrPzG3LgdR1qbZzqc+fWDnuAEIzYhC+EmIGimC+eOgM4NztK9U/7fqaF0VDgxXq1R4srx4pimp3AabdiwkNdYEslOc7gY+3z5+XAKfakP7yrWP6n5hdceV53fwCakF9gLq8u9adfBkZfgMQU285dhvBMWz0zgcwkwIDAQAB"
+      # ── L4 tenant-host binding ────────────────────────────────────────────
+      ONIFIED_RBAC_TENANT_HOST_BINDING_ENFORCE: "false"
+      # ── Heap override (matches Dockerfile default) ────────────────────────
+      HEAP: "512m"
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka:    { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    # Host port mapping (see onified-ports.md). Bound to 127.0.0.1 so the
+    # service is reachable from this machine for dev/curl but is NOT
+    # published to the LAN — every block below carries dev-only secrets and
+    # no direct-access auth perimeter. Normal traffic still goes via internal-gateway.
+    ports:
+      - "127.0.0.1:8089:8089"
+      - "127.0.0.1:8505:8505"
+    deploy:
+      resources:
+        limits:
+          memory: 900m
+          cpus: '0.75'
+        reservations:
+          memory: 512m
+          cpus: '0.25'
+    networks:
+      - default
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # INTEGRATION  (port: 8090)        tier: 3 — external connectors
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Role:       Third-party SaaS integrations (ULIP etc.), connector registry,
+  #             field mappings, sync configs. Uses Vault for API cred rotation.
+  # Calls:      iam (S2S token), job-orchestration (schedule jobs),
+  #             vault, external SaaS APIs.
+  # Called by:  job-orchestration (callbacks), internal-gateway (routing target).
+  # If commented out: external sync flows pause. Other things unaffected.
+  # ───────────────────────────────────────────────────────────────────────────
+  integration:
+    container_name: onified-integration
+    image: onified/integration:dev
+    restart: unless-stopped
+    build:
+      context: ..
+      dockerfile: services/platform/integration/Dockerfile.local-dev
+      secrets:
+        - source: gitlab_user
+        - source: gitlab_token
+    environment:
+      # ── Profile + DB ──────────────────────────────────────────────────────
+      SPRING_PROFILES_ACTIVE: local
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/onified_beta_local?currentSchema=integration
+      DB_SCHEMA: integration
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: "Thekapilg"
+      # Switched to Hibernate ddl-auto=update locally — Flyway's migration set is
+      # missing a table (wh_out_delivery) that a scheduled worker queries on boot.
+      # No RLS in this service's migrations (verified), so this is safe.
+      # NOTE: this comment predates a fix — the ddl-auto override below never
+      # actually existed, so with Flyway off AND ddl-auto still "validate"
+      # (application.yml's own value), Hibernate never created a single table
+      # (confirmed: 0 tables in platform_integration_service). Adding the
+      # override now to match what this block always intended.
+      SPRING_FLYWAY_ENABLED: "false"
+      SPRING_JPA_HIBERNATE_DDL_AUTO: update
+      # application.yml ALSO sets the raw hibernate.hbm2ddl.auto property directly
+      # (spring.jpa.properties.hibernate.hbm2ddl.auto: none) — that native property
+      # takes precedence over the ddl-auto alias above and was silently winning,
+      # which is the actual reason zero tables were ever created. Override it too.
+      SPRING_JPA_PROPERTIES_HIBERNATE_HBM2DDL_AUTO: update
+      # ── Kafka / Redis ─────────────────────────────────────────────────────
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: "6379"
+      # ── Cross-service URLs ────────────────────────────────────────────────
+      ONIFIED_RBAC_CONSTRAINT_FETCH_URL: http://iam:8082/internal/v1/constraints/fetch
+      ONIFIED_RBAC_USER_MANAGEMENT_URL: http://iam:8082
+      IDENTITY_BASE_URL: http://iam:8082
+      JOB_ORCHESTRATION_BASE_URL: http://job-orchestration:8095
+      # IDENTITY_BASE_URL/JOB_ORCHESTRATION_BASE_URL above don't match the property
+      # names integration's own clients actually bind to — these are the real ones:
+      IDENTITY_SERVICE_URL: http://iam:8082
+      JOB_ORCHESTRATION_SERVICE_URL: http://job-orchestration:8095
+      # Required, no default — ServiceAccountTokenProvider needs it to mint its own
+      # S2S token against iam.
+      IS_SERVICE_ACCOUNT_PASSWORD: "dev-throwaway-password"
+      # ── ULIP (sandbox) ───────────────────────────────────────────────────────
+      # Resolved via PlatformSecretProperties (platform.secrets.credentials.ULIP_*) —
+      # was previously hardcoded directly in application.yml; moved here so it isn't
+      # committed to source. Sandbox creds, not production.
+      ULIP_USERNAME: "gdbf_technum_usr"
+      ULIP_PASSWORD: "Ef?PoVqV7t"
+      ULIP_BASE_URL: "https://www.ulip.dpiit.gov.in/ulip/v1.0.0"
+      # ── Vault ─────────────────────────────────────────────────────────────
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN: root
+      # ── Logging SDK ───────────────────────────────────────────────────────
+      LOGGING_SDK_BOOTSTRAP_SERVERS: kafka:29092
+      LOGGING_SDK_OTEL_ENABLED: "false"
+      # ── gRPC server (inbound) + s2s clients to content/iam/platform-data
+      # (DocumentGrpcGateway, JwtTokenGrpcGateway, VerificationRecordGrpcGateway).
+      GRPC_SERVER_PORT: "8507"
+      CONTENT_GRPC_PORT: "8501"
+      IDENTITY_GRPC_PORT: "8500"
+      PLATFORM_DATA_GRPC_PORT: "8502"
+      # ── Auth secrets (DEV ONLY) ───────────────────────────────────────────
+      ONIFIED_JWT_SECRET_KEY: "ZGV2LW9ubHktc2VjcmV0LW5vdC1mb3ItcHJvZC1kby1ub3QtdXNlLTMyYnl0ZXM="
+      ONIFIED_RBAC_TOKEN_SECRET: "ZGV2LXJiYWMtdG9rZW4tc2VjcmV0LTMyLWJ5dGVzISE="
+      ONIFIED_RBAC_RS256_TRUSTED_PUBLIC_KEYS: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2bKXEiiD+/qZrfMRJUGVsnj/5mBLr+gdJZpmVJ4XqDaYx7i59V9EMWN+DvzAa08QaCgGbfGTQCVI6Kxjl1cr7GPPIp0XzmZJ6vAbnkXZBEiyfwDXo7a4EnOGzi0B493zyYru/CNbdMvS4LjNmkrUxb32zbVHhX4Zn51Ml0Uivk36sBIyamNAAIrPzG3LgdR1qbZzqc+fWDnuAEIzYhC+EmIGimC+eOgM4NztK9U/7fqaF0VDgxXq1R4srx4pimp3AabdiwkNdYEslOc7gY+3z5+XAKfakP7yrWP6n5hdceV53fwCakF9gLq8u9adfBkZfgMQU285dhvBMWz0zgcwkwIDAQAB"
+      # ── L4 tenant-host binding ────────────────────────────────────────────
+      ONIFIED_RBAC_TENANT_HOST_BINDING_ENFORCE: "false"
+      # ── Heap override (matches Dockerfile default) ────────────────────────
+      # Bumped from 512m — this service's Kafka+gRPC+RBAC-cache bean graph
+      # (32 JPA repos, DLT consumer, 3 gRPC clients) OOM-killed at boot under
+      # the 900m/512m tier other lighter services on this tier use fine.
+      HEAP: "1g"
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka:    { condition: service_healthy }
+      redis:    { condition: service_healthy }
+      vault:    { condition: service_started }
+    # Host port mapping (see onified-ports.md). Bound to 127.0.0.1 so the
+    # service is reachable from this machine for dev/curl but is NOT
+    # published to the LAN — every block below carries dev-only secrets and
+    # no direct-access auth perimeter. Normal traffic still goes via internal-gateway.
+    ports:
+      - "127.0.0.1:8090:8090"
+      - "127.0.0.1:8507:8507"
+    deploy:
+      resources:
+        limits:
+          memory: 1.5g
+          cpus: '0.75'
+        reservations:
+          memory: 1g
+          cpus: '0.25'
+    networks:
+      - default
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB-ORCHESTRATION  (port: 8095)  tier: 3 — Quartz scheduler
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Role:       Quartz scheduler with JDBC store. Generic HTTP-callback job
+  #             dispatch. Single-instance (no HA in local).
+  # Calls:      iam (S2S token, 45-min refresh), integration / content /
+  #             master-data / platform-data (configurable callback targets).
+  # Called by:  integration (registers schedules), internal-gateway (routing target).
+  # If commented out: scheduled jobs don't fire. Anything that registered a
+  #                   schedule (integration syncs) silently no-ops.
+  # ───────────────────────────────────────────────────────────────────────────
+  job-orchestration:
+    container_name: onified-job-orchestration
+    image: onified/job-orchestration:dev
+    restart: unless-stopped
+    build:
+      context: ..
+      dockerfile: services/platform/job-orchestration/Dockerfile.local-dev
+      secrets:
+        - source: gitlab_user
+        - source: gitlab_token
+    environment:
+      # ── Profile + DB ──────────────────────────────────────────────────────
+      SPRING_PROFILES_ACTIVE: local
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/onified_beta_local?currentSchema=job_orchestration
+      DB_SCHEMA: job_orchestration
+      # Schema of ANOTHER service, read by the central dispatcher over its own
+      # pool (onified.event-bus.dispatcher.outbox-tables in application-local.yml):
+      # work-management's wm_outbox_event / wm_inbox_event, i.e. the OpenSearch
+      # index-request leg. Must equal work-management's own DB_SCHEMA below.
+      WORK_MANAGEMENT_DB_SCHEMA: work_management
+      SPRING_JPA_HIBERNATE_DDL_AUTO: update
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: "Thekapilg"
+      # Switched to Hibernate ddl-auto=update locally — Flyway migration tries to
+      # drop a constraint that doesn't exist on a fresh schema. No RLS in this
+      # service's migrations (verified), so this is safe.
+      SPRING_FLYWAY_ENABLED: "false"
+      # ── Kafka / Redis ─────────────────────────────────────────────────────
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: "6379"
+      # ── Cross-service URLs (callback targets) ─────────────────────────────
+      ONIFIED_RBAC_CONSTRAINT_FETCH_URL: http://iam:8082/internal/v1/constraints/fetch
+      IDENTITY_BASE_URL: http://iam:8082
+      # IDENTITY_BASE_URL above doesn't match the property job-orchestration's own
+      # clients actually bind to — these are the real ones:
+      IDENTITY_SERVICE_URL: http://iam:8082
+      ONIFIED_RBAC_USER_MANAGEMENT_URL: http://iam:8082
+      INTEGRATION_SERVICE_URL: http://integration:8090
+      CONTENT_SERVICE_URL: http://content:8081
+      MASTER_DATA_SERVICE_URL: http://master-data:8086
+      PLATFORM_DATA_SERVICE_URL: http://platform-data:8085
+      # ── Logging SDK ───────────────────────────────────────────────────────
+      LOGGING_SDK_BOOTSTRAP_SERVERS: kafka:29092
+      LOGGING_SDK_OTEL_ENABLED: "false"
+      # ── Auth secrets (DEV ONLY) ───────────────────────────────────────────
+      ONIFIED_JWT_SECRET_KEY: "ZGV2LW9ubHktc2VjcmV0LW5vdC1mb3ItcHJvZC1kby1ub3QtdXNlLTMyYnl0ZXM="
+      ONIFIED_RBAC_TOKEN_SECRET: "ZGV2LXJiYWMtdG9rZW4tc2VjcmV0LTMyLWJ5dGVzISE="
+      ONIFIED_RBAC_RS256_TRUSTED_PUBLIC_KEYS: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2bKXEiiD+/qZrfMRJUGVsnj/5mBLr+gdJZpmVJ4XqDaYx7i59V9EMWN+DvzAa08QaCgGbfGTQCVI6Kxjl1cr7GPPIp0XzmZJ6vAbnkXZBEiyfwDXo7a4EnOGzi0B493zyYru/CNbdMvS4LjNmkrUxb32zbVHhX4Zn51Ml0Uivk36sBIyamNAAIrPzG3LgdR1qbZzqc+fWDnuAEIzYhC+EmIGimC+eOgM4NztK9U/7fqaF0VDgxXq1R4srx4pimp3AabdiwkNdYEslOc7gY+3z5+XAKfakP7yrWP6n5hdceV53fwCakF9gLq8u9adfBkZfgMQU285dhvBMWz0zgcwkwIDAQAB"
+      # ── L4 tenant-host binding ────────────────────────────────────────────
+      ONIFIED_RBAC_TENANT_HOST_BINDING_ENFORCE: "false"
+      # ── Heap override (matches Dockerfile default) ────────────────────────
+      HEAP: "512m"
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka:    { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    # Host port mapping (see onified-ports.md). Bound to 127.0.0.1 so the
+    # service is reachable from this machine for dev/curl but is NOT
+    # published to the LAN — every block below carries dev-only secrets and
+    # no direct-access auth perimeter. Normal traffic still goes via internal-gateway.
+    ports:
+      - "127.0.0.1:8095:8095"
+    deploy:
+      resources:
+        limits:
+          memory: 900m
+          cpus: '0.75'
+        reservations:
+          memory: 512m
+          cpus: '0.25'
+    networks:
+      - default
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # WORK-MANAGEMENT  (port: 8092)    tier: 3 — tickets + chat + SLA
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Role:       Ticketing, chat (WebSocket STOMP), SLA policies. Cross-pod
+  #             WebSocket fan-out via Kafka topic wms-chat-broadcasts.
+  # Calls:      iam (S2S token + user/role lookup), content (attachments).
+  # Called by:  internal-gateway (routing target).
+  # If commented out: tickets + chat unavailable. Nothing else breaks.
+  # ───────────────────────────────────────────────────────────────────────────
+  work-management:
+    container_name: onified-work-management
+    image: onified/work-management:dev
+    restart: unless-stopped
+    build:
+      context: ..
+      dockerfile: services/platform/work-management/Dockerfile.local-dev
+      secrets:
+        - source: gitlab_user
+        - source: gitlab_token
+    environment:
+      # ── Profile + DB ──────────────────────────────────────────────────────
+      SPRING_PROFILES_ACTIVE: local
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/onified_beta_local?currentSchema=work_management
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: "Thekapilg"
+      DB_SCHEMA: work_management
+      SPRING_JPA_HIBERNATE_DDL_AUTO: update
+      SERVER_PORT: "8092"
+      SPRING_FLYWAY_ENABLED: "false"
+      # Required, no default in base application.yaml (beta/prod set it or default
+      # to localhost:3000) — frontend base URL used to build shareable links.
+      SHARE_BASE_URL: "http://localhost:3000"
+      # Base application.yaml's public-paths whitelist lists the correctly-spelled
+      # "/work-management-service/actuator/health/**", but HealthController.java is
+      # actually registered under a typo'd path ("/work-managment-service/..." —
+      # missing the middle "e"), so the whitelist entry never matches it and the
+      # Dockerfile healthcheck 401s. Same list as the base yaml, plus the real path.
+      ONIFIED_RBAC_PUBLIC_PATHS_PATTERNS: "/swagger-ui/**,/v3/api-docs/**,/swagger-ui.html,/ws/chat/**,/api/v1/auth/**,/api/v1/rbac-auth/**,/h2-console/**,/work-management-service/actuator/health/**,/work-managment-service/actuator/health/**,/chat/actuator/health/**,/actuator/health/**,/actuator/prometheus,/actuator/info,/work-management-service/swagger-ui/**,/work-management-service/v3/api-docs/**,/public/v1/note/**,/s/**"
+      # ── Kafka / Redis ─────────────────────────────────────────────────────
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: "6379"
+      # ── Cross-service URLs ────────────────────────────────────────────────
+      ONIFIED_RBAC_CONSTRAINT_FETCH_URL: http://iam:8082/internal/v1/constraints/fetch
+      ONIFIED_RBAC_USER_MANAGEMENT_URL: http://iam:8082
+      IDENTITY_BASE_URL: http://iam:8082
+      # IDENTITY_BASE_URL above doesn't match the property work-management's own
+      # IdentityRestClient actually binds to (iam.service.url) — the real one:
+      IDENTITY_SERVICE_URL: http://iam:8082
+      FILE_STORAGE_SERVICE_URL: http://content:8081
+      # es-sync's field-registry resolver (onified.opensearch-sync.field-registry
+      # in application-local.yml) calls platform-data's internal search endpoint.
+      PLATFORM_DATA_SERVICE_URL: http://platform-data:8085
+      # ── OpenSearch (es-sync search indexing) ──────────────────────────────
+      # In-network hostname:port — NOT the 9210 host mapping. The library's own
+      # default is localhost:9200, which inside this container is nothing, so
+      # this must be set explicitly. Auth is intentionally absent: the local
+      # cluster runs with the security plugin disabled.
+      OPENSEARCH_URL: http://opensearch:9200
+      # ── Logging SDK ───────────────────────────────────────────────────────
+      LOGGING_SDK_BOOTSTRAP_SERVERS: kafka:29092
+      LOGGING_SDK_OTEL_ENABLED: "false"
+      # ── gRPC server (inbound) + s2s clients to iam/content/billing-subscription
+      # (JwtTokenGrpcGateway, UserAvatarGrpcGateway, DocumentGrpcGateway, EntitlementGrpcGateway).
+      GRPC_SERVER_PORT: "8506"
+      IDENTITY_GRPC_PORT: "8500"
+      CONTENT_GRPC_PORT: "8501"
+      BILLING_GRPC_PORT: "8503"
+      # ── Auth secrets (DEV ONLY) ───────────────────────────────────────────
+      ONIFIED_JWT_SECRET_KEY: "ZGV2LW9ubHktc2VjcmV0LW5vdC1mb3ItcHJvZC1kby1ub3QtdXNlLTMyYnl0ZXM="
+      ONIFIED_RBAC_TOKEN_SECRET: "ZGV2LXJiYWMtdG9rZW4tc2VjcmV0LTMyLWJ5dGVzISE="
+      # ── Share-link token signing (DEV ONLY) ───────────────────────────────
+      # ShareTokenKeyProvider requires a non-empty PKCS8 RSA private key at boot;
+      # prod/beta get this from Vault. Throwaway 2048-bit dev-only keypair, no
+      # real share links are internal-gateway-verified locally so this carries no risk.
+      SHARE_TOKEN_KID: "wm-share-local-dev"
+      SHARE_TOKEN_SIGNING_KEY: "MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDn2oVhmqIPpLIVjItlpijQIa96atONFZSv3E2/XZcynpa0dZorfHdQHOBCd+jtvlTc8wHjyA+j8O0Ys2AFcWqEMRLXrE1msedXAg7sj3MRlI6KP2RV+gCSZVdcjGQHq4KRVcw0JXUUujW2QVFcBEQk8u8AXgxKnf5wN+opr//PJbJFgvSCtX0aCt9Zau2pWj4zt2PLaudvbxUN75RFlxDtWPTmq+R+sU8RyTa3dyN4LoJe3m+rdwfXKkkca4gQV5zjuHudH/qDZQ0tOtRb/SD1QFG9gdSW95Tu67ryGDHIm6j+ekg7gBv/xAL5WvBOrabFF2xRkUcpO3qXq7uJWeJzAgMBAAECggEAalmglAhXrSBJNbw9ltdUYkAJW3hT6KPNC6vcl9qIx8XZ8BX/rVHO8tcEAUk6dY84Iw9uvvqePf996jYhZe3Dw7Y04+wbpu8U5CLEELuuNxKzHXP9hLiD+aL1ozScj64a2qqF3CeQYH0XtS2Z8cDdNyud+MerELEPLI9hYFTkXLIY2sjvw6fVxeEIeleeY9bhfuhTPkrqXXXPPHFdskBoh84QiR6/qGCuBcN8DHaP+9y2ArDeJ7GD6AVYADf7vjXlPtEICk2OgAFXDGZtpHkIz5OoDCjC39wsAvJ7Y0Q9+LpYDIH+xaam7oEPSQYwel81+UWHOVhAxosdz+mMNgCpwQKBgQD4hT5YETJEnQamc7Vi4N3IUtQRNJ+yD9h+D3/yaq7tVx8SpHAykEKyhSD4dRscJ5g/UDs6pWRz+gNvUCw5Uhh7c1OtWoJLsPudyVdTq85AOBSNwSwTyn5J0jAc9a1acjrQzftQOeN0lqNyAQZKjUCzvoTmvGlCLI27BS6D12XkswKBgQDu1N2NMv8nHk8PnQeS1dQH1o9LkRLy+v0cW98S9kNd/+ldAl2vDUuEuPYDA8RQfyIRcuMwLpKXdiZt1ljl62njozSlOChaU64RgChGyzt3WHQ3s3MAJ+MXa3vGZ4zbFawHX3cETmVeQPHzwfuIeA0avVcONDQJ4qjMLgLyEIxrQQKBgQCn1jS4fUSZmgK3v0UstfiSJX4a8JM5SgJHgGhEa1Af8cqGaI9tVof00Hvn0A6zAPqNJ74YaUJiIOLY9ignvg3SsZw9YvbD746+jQ9w7oKoVDdtVJxT8VlAubbMmA6vGp4mDjY/hBjc0C8p+w8ooiSkP3K58VyU2EoPl/xGBd5GiQKBgG3p1yCRdK27HCWSXhbsg40r6HydgnwCmJQBj/M5FJ3hFbPxT84tLzEgsk+G30UwjSw8lGPrOxmrjVoFSJpfsjbKOINFCgUv968kLOUPyQlO0wWDd4x9ztxLYgZYR5HYMnieLbb0oWA0QWWuQ6V1oopI0xS9X6mg/5AgKMjgZs9BAoGBAOgzaip1nyVFVBYirBltFF8d60F0FaSU/eO/A/te7cAgMrk7+wrCTjs/s31iKkrJwiP1wz2fXcEeK2vaOqj9Fn7qCJGsI3pm4+XRDtmKmZXFAce/i3sTpCa/bBPQU/PNth6Z4BeGmy5KPYu+RLBVY5atZZJVtIzzkSz6UA7YH/93"
+      # ── RS256 JWT verification (DEV ONLY) ─────────────────────────────────
+      # rbac-library 3.2.7 verifies RS256 only (no HS256 fallback). Trust
+      # iam's signing key so tokens minted by iam's login flow
+      # validate on this service's protected endpoints too.
+      ONIFIED_RBAC_RS256_TRUSTED_PUBLIC_KEYS: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2bKXEiiD+/qZrfMRJUGVsnj/5mBLr+gdJZpmVJ4XqDaYx7i59V9EMWN+DvzAa08QaCgGbfGTQCVI6Kxjl1cr7GPPIp0XzmZJ6vAbnkXZBEiyfwDXo7a4EnOGzi0B493zyYru/CNbdMvS4LjNmkrUxb32zbVHhX4Zn51Ml0Uivk36sBIyamNAAIrPzG3LgdR1qbZzqc+fWDnuAEIzYhC+EmIGimC+eOgM4NztK9U/7fqaF0VDgxXq1R4srx4pimp3AabdiwkNdYEslOc7gY+3z5+XAKfakP7yrWP6n5hdceV53fwCakF9gLq8u9adfBkZfgMQU285dhvBMWz0zgcwkwIDAQAB"
+      # ── L4 tenant-host binding ────────────────────────────────────────────
+      ONIFIED_RBAC_TENANT_HOST_BINDING_ENFORCE: "false"
+      # ── Heap override ─────────────────────────────────────────────────────
+      # 1024m heap fits the 2g container limit once the Dockerfile's off-heap
+      # caps (metaspace 384m + direct 256m + code-cache 192m + thread stacks)
+      # are accounted for. Prod uses HEAP=1536m and MUST raise the memory limit
+      # to >= 3Gi to match — see RUNTIME_OBSERVABILITY.md §"Memory budget".
+      HEAP: "1024m"
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka:    { condition: service_healthy }
+      redis:    { condition: service_healthy }
+      # es-sync builds its OpenSearch client at startup — wait for the cluster
+      # to report healthy so the first index call isn't a connection refusal.
+      opensearch: { condition: service_healthy }
+    # Host port mapping (see onified-ports.md). Bound to 127.0.0.1 so the
+    # service is reachable from this machine for dev/curl but is NOT
+    # published to the LAN — every block below carries dev-only secrets and
+    # no direct-access auth perimeter. Normal traffic still goes via internal-gateway.
+    ports:
+      - "127.0.0.1:8092:8092"
+      - "127.0.0.1:8506:8506"
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+          cpus: '1.5'
+        reservations:
+          memory: 1280m
+          cpus: '0.5'
+    networks:
+      - default
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # WORKFLOW  (port: 8093)           tier: 3 — workflow engine
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Role:       Home-grown workflow engine (no Camunda/Flowable). Definitions,
+  #             instances, approvals, quick actions, outbox events.
+  # Calls:      iam (S2S token + user lookup), master-data (lookups),
+  #             platform-data (approval-actor-types search).
+  # Called by:  internal-gateway (routing target).
+  # If commented out: workflow runtime + admin endpoints unavailable.
+  # ───────────────────────────────────────────────────────────────────────────
+  workflow:
+    container_name: onified-workflow
+    image: onified/workflow:dev
+    restart: unless-stopped
+    build:
+      context: ..
+      dockerfile: services/platform/workflow/Dockerfile.local-dev
+      secrets:
+        - source: gitlab_user
+        - source: gitlab_token
+    environment:
+      # ── Profile + DB ──────────────────────────────────────────────────────
+      SPRING_PROFILES_ACTIVE: local
+      # workflow's actual data + full Flyway history (17 migrations) live under a
+      # schema literally named "workflow" — confirmed live (0 tables and no Flyway
+      # history at all under platform_workflow_service, which was a stale/unused
+      # name). This is the base application.yml's own default too; only this
+      # compose override had drifted from it.
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/onified_beta_local?currentSchema=workflow
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: "Thekapilg"
+      DB_SCHEMA: workflow
+      SPRING_JPA_HIBERNATE_DDL_AUTO: update
+      SERVER_PORT: "8093"
+      SPRING_FLYWAY_ENABLED: "false"
+      # ── Kafka / Redis ─────────────────────────────────────────────────────
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: "6379"
+      # ── Cross-service URLs ────────────────────────────────────────────────
+      ONIFIED_RBAC_CONSTRAINT_FETCH_URL: http://iam:8082/internal/v1/constraints/fetch
+      IDENTITY_BASE_URL: http://iam:8082
+      # Separate from IDENTITY_BASE_URL above — a different workflow client reads
+      # this exact name (application.yml:110), else it falls back to localhost:8081.
+      IDENTITY_SERVICE_URL: http://iam:8082
+      # Required so the rbac-library's AuthorityPolicyLoader bean gets created (see
+      # application-local.yml comment) — without it workflow crash-loops on boot.
+      ONIFIED_RBAC_USER_MANAGEMENT_URL: http://iam:8082
+      # NOTE: master-data is on 8086 (the codebase's default :8091 is wrong —
+      # see architecture doc). Explicit override here.
+      MDS_SERVICE_URL: http://master-data:8086
+      # workflow's own client binds this from PDS_SERVICE_URL, not
+      # PLATFORM_DATA_SERVICE_URL — that name is dead, app falls back to its
+      # yaml default (localhost:8085), which is wrong inside this container.
+      PDS_SERVICE_URL: http://platform-data:8085
+      # ── Logging SDK ───────────────────────────────────────────────────────
+      LOGGING_SDK_BOOTSTRAP_SERVERS: kafka:29092
+      LOGGING_SDK_OTEL_ENABLED: "false"
+      # ── gRPC server (inbound) + s2s client to billing-subscription
+      # (EntitlementGrpcGateway, target key "billing-subscription-service").
+      GRPC_SERVER_PORT: "8512"
+      BILLING_GRPC_PORT: "8503"
+      # ── Auth secrets (DEV ONLY) ───────────────────────────────────────────
+      ONIFIED_JWT_SECRET_KEY: "ZGV2LW9ubHktc2VjcmV0LW5vdC1mb3ItcHJvZC1kby1ub3QtdXNlLTMyYnl0ZXM="
+      ONIFIED_RBAC_TOKEN_SECRET: "ZGV2LXJiYWMtdG9rZW4tc2VjcmV0LTMyLWJ5dGVzISE="
+      # ── RS256 JWT verification (DEV ONLY) ─────────────────────────────────
+      # rbac-library 3.2.7 verifies RS256 only (no HS256 fallback). Trust
+      # iam's signing key so tokens minted by iam's login flow
+      # validate on this service's protected endpoints too.
+      ONIFIED_RBAC_RS256_TRUSTED_PUBLIC_KEYS: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2bKXEiiD+/qZrfMRJUGVsnj/5mBLr+gdJZpmVJ4XqDaYx7i59V9EMWN+DvzAa08QaCgGbfGTQCVI6Kxjl1cr7GPPIp0XzmZJ6vAbnkXZBEiyfwDXo7a4EnOGzi0B493zyYru/CNbdMvS4LjNmkrUxb32zbVHhX4Zn51Ml0Uivk36sBIyamNAAIrPzG3LgdR1qbZzqc+fWDnuAEIzYhC+EmIGimC+eOgM4NztK9U/7fqaF0VDgxXq1R4srx4pimp3AabdiwkNdYEslOc7gY+3z5+XAKfakP7yrWP6n5hdceV53fwCakF9gLq8u9adfBkZfgMQU285dhvBMWz0zgcwkwIDAQAB"
+      # ── L4 tenant-host binding ────────────────────────────────────────────
+      ONIFIED_RBAC_TENANT_HOST_BINDING_ENFORCE: "false"
+      # ── Heap override (matches Dockerfile default) ────────────────────────
+      HEAP: "768m"
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka:    { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    # Host port mapping (see onified-ports.md). Bound to 127.0.0.1 so the
+    # service is reachable from this machine for dev/curl but is NOT
+    # published to the LAN — every block below carries dev-only secrets and
+    # no direct-access auth perimeter. Normal traffic still goes via internal-gateway.
+    ports:
+      - "127.0.0.1:8093:8093"
+      - "127.0.0.1:8512:8512"
+    deploy:
+      resources:
+        limits:
+          memory: 1.25g
+          cpus: '0.75'
+        reservations:
+          memory: 768m
+          cpus: '0.25'
+    networks:
+      - default
+
+  # ═══ SSO — commented out: standalone service removed in commit 27fc81292
+  # ("chore: remove standalone SSO service (merged into iam)") — services/platform/sso
+  # no longer exists on disk, so this block cannot build. SSO functionality now lives in iam.
+  #   # ═══════════════════════════════════════════════════════════════════════════
+  #   # SSO  (port: 8091)                tier: 2 — single sign-on
+  #   # ═══════════════════════════════════════════════════════════════════════════
+  #   # Role:       SAML/OIDC SSO callbacks, SCIM 2.0 directory sync (nightly cron),
+  #   #             magic-link auth, in-memory bucket4j rate-limit.
+  #   # Calls:      iam (constraint fetch + user creation), kafka (magic-link
+  #   #             notifications).
+  #   # Called by:  internal-gateway (routing target), iam (cross-tenant SSO flows).
+  #   # If commented out: SSO/SAML/OIDC and magic-link flows fail. Password auth
+  #   #                   via iam still works.
+  #   # Note:       Native port is 8090 (collides with integration). SERVER_PORT
+  #   #             overrides to 8091 inside the container so external and
+  #   #             internal ports align.
+  #   # ───────────────────────────────────────────────────────────────────────────
+  #   sso:
+  #     container_name: onified-sso
+  #     image: onified/sso:dev
+  #     restart: unless-stopped
+  #     build:
+  #       context: ..
+  #       dockerfile: services/platform/sso/Dockerfile
+  #       secrets:
+  #         - source: gitlab_user
+  #         - source: gitlab_token
+  #     environment:
+  #       # ── Profile + DB ──────────────────────────────────────────────────────
+  #       SPRING_PROFILES_ACTIVE: local
+  #       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/onified_beta_local?currentSchema=iam
+  #       SPRING_DATASOURCE_USERNAME: postgres
+  #       SPRING_DATASOURCE_PASSWORD: "Thekapilg"
+  #       # Port override — native 8090 collides with integration.
+  #       SERVER_PORT: "8091"
+  #       # ── Kafka / Redis ─────────────────────────────────────────────────────
+  #       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+  #       SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+  #       SPRING_DATA_REDIS_HOST: redis
+  #       SPRING_DATA_REDIS_PORT: "6379"
+  #       # ── Cross-service URLs ────────────────────────────────────────────────
+  #       ONIFIED_RBAC_CONSTRAINT_FETCH_URL: http://iam:8082/internal/v1/constraints/fetch
+  #       IDENTITY_SERVICE_URL: http://iam:8082
+  #       # ── Logging SDK ───────────────────────────────────────────────────────
+  #       LOGGING_SDK_BOOTSTRAP_SERVERS: kafka:29092
+  #       LOGGING_SDK_OTEL_ENABLED: "false"
+  #       # ── Auth secrets (DEV ONLY) ───────────────────────────────────────────
+  #       ONIFIED_JWT_SECRET_KEY: "ZGV2LW9ubHktc2VjcmV0LW5vdC1mb3ItcHJvZC1kby1ub3QtdXNlLTMyYnl0ZXM="
+  #       ONIFIED_RBAC_TOKEN_SECRET: "ZGV2LXJiYWMtdG9rZW4tc2VjcmV0LTMyLWJ5dGVzISE="
+  #       # ── L4 tenant-host binding ────────────────────────────────────────────
+  #       ONIFIED_RBAC_TENANT_HOST_BINDING_ENFORCE: "false"
+  #       # ── Heap override (matches Dockerfile default) ────────────────────────
+  #       HEAP: "512m"
+  #     depends_on:
+  #       postgres: { condition: service_healthy }
+  #       kafka:    { condition: service_healthy }
+  #       redis:    { condition: service_healthy }
+  #     ports:
+  #       - "8091:8091"
+  #     deploy:
+  #       resources:
+  #         limits:
+  #           memory: 900m
+  #           cpus: '0.75'
+  #         reservations:
+  #           memory: 512m
+  #           cpus: '0.25'
+  #     networks:
+  #       - default
+  # 
+  # ═══════════════════════════════════════════════════════════════════════════
+  # GEO  (port: 8096)                tier: 3 — geofence + live location
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Role:       Geofence policies, live location/trip tracking via WebSocket,
+  #             14+ Kafka producers (geo events / alerts / signals), consent
+  #             enforcement, signal-spoofing detection.
+  # Calls:      iam (constraint fetch), master-data (kafka consumer for
+  #             geofence.master.changed.v1).
+  # Called by:  internal-gateway (routing target), cargo (location lookups), frontend
+  #             (WebSocket /ws/geo).
+  # If commented out: live location, geofence enforcement, and cargo trip
+  #                   tracking break. Other services continue.
+  # ───────────────────────────────────────────────────────────────────────────
+  geo:
+    container_name: onified-geo
+    image: onified/geo:dev
+    restart: unless-stopped
+    build:
+      context: ..
+      dockerfile: services/platform/geo/Dockerfile.local-dev
+      secrets:
+        - source: gitlab_user
+        - source: gitlab_token
+    environment:
+      # ── Profile + DB ──────────────────────────────────────────────────────
+      SPRING_PROFILES_ACTIVE: local
+      # currentSchema fully REPLACES the JDBC session's search_path (it does not prepend/append) —
+      # "geolocation" alone drops "public", where the postgis extension's functions live, so every
+      # native query calling ST_MakePoint/ST_Covers/etc (geofence resolve, master route recompute)
+      # failed with "function st_makepoint(...) does not exist". Must list both schemas.
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/onified_beta_local?currentSchema=geolocation,public
+      DB_SCHEMA: geolocation
+      SPRING_JPA_HIBERNATE_DDL_AUTO: update
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: "Thekapilg"
+      # Reverted to Flyway — geo has PostGIS geometry columns Hibernate's ddl-auto
+      # cannot generate DDL for at all (hard limitation, not just inconvenience).
+      # The one missing table (event_outbox) is added directly via SQL instead.
+      SPRING_FLYWAY_ENABLED: "false"
+      SPRING_FLYWAY_URL: jdbc:postgresql://postgres:5432/onified_beta_local?currentSchema=geolocation
+      SPRING_FLYWAY_USER: postgres
+      SPRING_FLYWAY_PASSWORD: "Thekapilg"
+      SPRING_FLYWAY_SCHEMAS: geolocation
+      SPRING_FLYWAY_PLACEHOLDERS_DB_SCHEMA: geolocation
+      # LOCATIONS override is REQUIRED and was missing: base application.yml
+      # points at classpath:db/migration/local, which does not exist on disk —
+      # geo's 27 migrations live in db/migration. failOnMissingLocations
+      # defaults to false, so ENABLED=true alone applied ZERO migrations and
+      # only created flyway_schema_history, silently leaving platform_geo empty.
+      SPRING_FLYWAY_LOCATIONS: classpath:db/migration
+      # ── Kafka / Redis ─────────────────────────────────────────────────────
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: "6379"
+      # ── Cross-service URLs ────────────────────────────────────────────────
+      ONIFIED_RBAC_CONSTRAINT_FETCH_URL: http://iam:8082/internal/v1/constraints/fetch
+      IDENTITY_BASE_URL: http://iam:8082
+      MASTER_DATA_SERVICE_URL: http://master-data:8086
+      # MASTER_DATA_SERVICE_URL above doesn't match the property geo's own
+      # MasterDataClient actually binds to (onified.masterdata.base-url) — the real one:
+      MASTERDATA_SERVICE_URL: http://master-data:8086
+      # Same class of bug as MASTERDATA_SERVICE_URL above: PlatformDataSequenceClient's REST
+      # fallback binds to onified.platformdata.base-url, driven by PLATFORM_DATA_BASE_URL — this
+      # var was missing entirely, so it defaulted to http://localhost:8085 (geo's OWN container,
+      # not platform-data's), and every sequence issuance that fell back to REST (after a gRPC
+      # timeout) failed with connection refused -> GEO.SEQUENCE_GENERATION_FAILED on every create.
+      PLATFORM_DATA_BASE_URL: http://platform-data:8085
+      # Same AuthorityPolicyLoader crash as workflow/billing-subscription.
+      ONIFIED_RBAC_USER_MANAGEMENT_URL: http://iam:8082
+      # ── RS256 JWT verification (DEV ONLY) ─────────────────────────────────
+      ONIFIED_RBAC_RS256_TRUSTED_PUBLIC_KEYS: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2bKXEiiD+/qZrfMRJUGVsnj/5mBLr+gdJZpmVJ4XqDaYx7i59V9EMWN+DvzAa08QaCgGbfGTQCVI6Kxjl1cr7GPPIp0XzmZJ6vAbnkXZBEiyfwDXo7a4EnOGzi0B493zyYru/CNbdMvS4LjNmkrUxb32zbVHhX4Zn51Ml0Uivk36sBIyamNAAIrPzG3LgdR1qbZzqc+fWDnuAEIzYhC+EmIGimC+eOgM4NztK9U/7fqaF0VDgxXq1R4srx4pimp3AabdiwkNdYEslOc7gY+3z5+XAKfakP7yrWP6n5hdceV53fwCakF9gLq8u9adfBkZfgMQU285dhvBMWz0zgcwkwIDAQAB"
+      # java-logging-sdk 4.0.3 DataResidencyGuard (G13 S11) rejects the local
+      # broker hostname 'kafka' as not looking like an India-region address.
+      LOGGING_SDK_ENFORCE_DATA_RESIDENCY: "false"
+      LOGGING_SDK_BOOTSTRAP_SERVERS: kafka:29092
+      LOGGING_SDK_OTEL_ENABLED: "false"
+      # ── gRPC server (inbound) + s2s client to governance
+      # (MonitoringPolicyGrpcGateway, target key "governance-service").
+      GRPC_SERVER_PORT: "8510"
+      GOVERNANCE_GRPC_PORT: "8504"
+      ONIFIED_JWT_SECRET_KEY: "ZGV2LW9ubHktc2VjcmV0LW5vdC1mb3ItcHJvZC1kby1ub3QtdXNlLTMyYnl0ZXM="
+      ONIFIED_RBAC_TOKEN_SECRET: "ZGV2LXJiYWMtdG9rZW4tc2VjcmV0LTMyLWJ5dGVzISE="
+      ONIFIED_RBAC_TENANT_HOST_BINDING_ENFORCE: "false"
+      HEAP: "768m"
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka:    { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    # Host port mapping (see onified-ports.md). Bound to 127.0.0.1 so the
+    # service is reachable from this machine for dev/curl but is NOT
+    # published to the LAN — every block below carries dev-only secrets and
+    # no direct-access auth perimeter. Normal traffic still goes via internal-gateway.
+    ports:
+      - "127.0.0.1:8096:8096"
+      - "127.0.0.1:8510:8510"
+    deploy:
+      resources:
+        limits:
+          memory: 1.25g
+          cpus: '0.75'
+        reservations:
+          memory: 768m
+          cpus: '0.25'
+    networks:
+      - default
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # CARGO  (port: 8094)              tier: app — freight/logistics orchestration
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Role:       Shipments, trips, carriers, drivers, finance (invoices/payments/
+  #             settlements), fleet, sub-broker, real-time tracking. 73 REST
+  #             controllers, 76 entities, outbox+saga pattern.
+  # Calls:      iam (S2S token + partner lookup), master-data (kafka
+  #             consumers for driver/vehicle/customer/route changes), geo
+  #             (location lookups), work-management (SLA timers), billing
+  #             (invoice/payment reconciliation), content (PoD evidence).
+  # Called by:  internal-gateway (routing target), driver mobile app (DriverMobileController).
+  # If commented out: cargo/logistics domain entirely unavailable. Platform
+  #                   services unaffected (cargo is apps-tier).
+  # Note:       Native port is 8082 (collides with iam). SERVER_PORT
+  #             overrides to 8094 inside the container so external and
+  #             internal ports align.
+  # ───────────────────────────────────────────────────────────────────────────
+  cargo:
+    container_name: onified-cargo
+    image: onified/cargo:dev
+    restart: unless-stopped
+    build:
+      context: ..
+      dockerfile: services/apps/cargo/Dockerfile.local-dev-jar
+      secrets:
+        - source: gitlab_user
+        - source: gitlab_token
+    environment:
+      # ── Profile + DB ──────────────────────────────────────────────────────
+      SPRING_PROFILES_ACTIVE: local
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/onified_beta_local
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: Thekapilg
+      # Port override — native 8082 collides with iam.
+      SERVER_PORT: "8094"
+      # ── Kafka / Redis ─────────────────────────────────────────────────────
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: "6379"
+      # ── Cross-service URLs ────────────────────────────────────────────────
+      ONIFIED_RBAC_CONSTRAINT_FETCH_URL: http://iam:8082/internal/v1/constraints/fetch
+      ONIFIED_RBAC_USER_MANAGEMENT_URL: http://iam:8082
+      IDENTITY_BASE_URL: http://iam:8082
+      MASTER_DATA_SERVICE_URL: http://master-data:8086
+      WORK_MANAGEMENT_BASE_URL: http://work-management:8092
+      BILLING_SERVICE_URL: http://billing-subscription:8084
+      CONTENT_SERVICE_URL: http://content:8081
+      GEO_SERVICE_URL: http://geo:8096
+      # None of the 6 vars above match what cargo's own @ConfigurationProperties
+      # classes actually bind to (all prefixed "cargo.<service>.base-url") — the
+      # real ones, confirmed against cargo's own config source:
+      CARGO_IDENTITY_BASE_URL: http://iam:8082
+      CARGO_MASTERDATA_BASE_URL: http://master-data:8086
+      CARGO_SLA_BASE_URL: http://work-management:8092
+      CARGO_BILLING_BASE_URL: http://billing-subscription:8084
+      CARGO_CONTENT_BASE_URL: http://content:8081
+      CARGO_GEO_BASE_URL: http://geo:8096
+      # Not set at all before (cargo.integration/cargo.platform-data properties):
+      CARGO_INTEGRATION_BASE_URL: http://integration:8090
+      CARGO_PLATFORM_DATA_BASE_URL: http://platform-data:8085
+      # cargo's vault-tenant-routing DataSource (same class of hard-wired
+      # dependency as master-data) needs its own secret-proxy — but a
+      # DIFFERENT instance from master-data's: the "sidecar" one
+      # (docker-compose.sidecar.yml + docker-compose.vault.yml), which
+      # backs onto vault2/9100, not the main vault:8200. It's on its own
+      # docker network (file-storage-net), reached here via the host port
+      # it maps out (9200), not a container hostname.
+      SECRET_PROXY_BASE_URL: http://host.docker.internal:9200
+      # ── Logging SDK ───────────────────────────────────────────────────────
+      LOGGING_SDK_BOOTSTRAP_SERVERS: kafka:29092
+      LOGGING_SDK_OTEL_ENABLED: "false"
+      # ── gRPC server (inbound) + s2s client to iam
+      # (RelationshipSharedResourceGrpcGateway / TenantPartnerRelationshipGrpcGateway,
+      # target key "iam-service").
+      GRPC_SERVER_PORT: "8511"
+      IDENTITY_GRPC_PORT: "8500"
+      # ── Auth secrets (DEV ONLY) ───────────────────────────────────────────
+      ONIFIED_JWT_SECRET_KEY: "ZGV2LW9ubHktc2VjcmV0LW5vdC1mb3ItcHJvZC1kby1ub3QtdXNlLTMyYnl0ZXM="
+      ONIFIED_RBAC_TOKEN_SECRET: "ZGV2LXJiYWMtdG9rZW4tc2VjcmV0LTMyLWJ5dGVzISE="
+      # cargo's config has no default for this (unlike workflow/iam) — same
+      # dev-only value dev-env.sh already uses for local bootRun.
+      ONIFIED_RBAC_INTERNAL_JWT_SECRET: "ad5581d9fb20ed04a3f5a9f4eeb9f6e99cfca9e838742b230e1ee159935ed538"
+      # ── RS256 JWT verification (DEV ONLY) ─────────────────────────────────
+      # trust iam's signing key so login-minted tokens validate here too.
+      ONIFIED_RBAC_RS256_TRUSTED_PUBLIC_KEYS: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2bKXEiiD+/qZrfMRJUGVsnj/5mBLr+gdJZpmVJ4XqDaYx7i59V9EMWN+DvzAa08QaCgGbfGTQCVI6Kxjl1cr7GPPIp0XzmZJ6vAbnkXZBEiyfwDXo7a4EnOGzi0B493zyYru/CNbdMvS4LjNmkrUxb32zbVHhX4Zn51Ml0Uivk36sBIyamNAAIrPzG3LgdR1qbZzqc+fWDnuAEIzYhC+EmIGimC+eOgM4NztK9U/7fqaF0VDgxXq1R4srx4pimp3AabdiwkNdYEslOc7gY+3z5+XAKfakP7yrWP6n5hdceV53fwCakF9gLq8u9adfBkZfgMQU285dhvBMWz0zgcwkwIDAQAB"
+      # cargo's base application.yml (no local override) lists /api/** as a public
+      # path — that bypasses RbacJwtAuthFilter entirely for every real cargo endpoint,
+      # so no Authentication ever lands in SecurityContext and TenantContextAccessor
+      # sees nothing → "Tenant context is required" even with a perfectly valid token.
+      # Source fixed (removed the line) but that needs a rebuild; this env var
+      # override achieves the same corrected list without one — matches beta/prod's
+      # own lists, which never had /api/** either.
+      ONIFIED_RBAC_PUBLIC_PATHS_PATTERNS: "/swagger-ui/**,/cargo-service/swagger-ui/**,/v3/api-docs/**,/cargo-service/v3/api-docs/**,/swagger-ui.html,/cargo-service/swagger-ui.html,/actuator/**,/cargo-service/actuator/**,/public/v1/trip/**,/internal/v1/**"
+      # ── L4 tenant-host binding ────────────────────────────────────────────
+      ONIFIED_RBAC_TENANT_HOST_BINDING_ENFORCE: "false"
+      # ── Heap override — minimized for a low-resource local run ────────────
+      HEAP: "768m"
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka:    { condition: service_healthy }
+      redis:    { condition: service_healthy }
+      # vault2-seed populates the "localtest-kv/db_cred" secret cargo's
+      # vault-tenant DataSource fetches through the sidecar secret-proxy —
+      # without it, cargo boots but every tenant-scoped query/migration fails.
+      vault2-seed: { condition: service_completed_successfully }
+      # SECRET_PROXY_BASE_URL above points at this container's host-mapped
+      # port (9200) — it's a separate overlay service, not pulled in by
+      # vault2-seed alone. Without this, `docker compose up cargo` never
+      # starts it and every tenant-scoped query fails silently.
+      sidecar-secret-proxy: { condition: service_started }
+    # Host port mapping (see onified-ports.md). Bound to 127.0.0.1 so the
+    # service is reachable from this machine for dev/curl but is NOT
+    # published to the LAN — every block below carries dev-only secrets and
+    # no direct-access auth perimeter. Normal traffic still goes via internal-gateway.
+    ports:
+      - "127.0.0.1:8094:8094"
+      - "127.0.0.1:8511:8511"
+    deploy:
+      resources:
+        limits:
+          memory: 1.25g
+          cpus: '1.0'
+        reservations:
+          memory: 768m
+          cpus: '0.25'
+    networks:
+      - default

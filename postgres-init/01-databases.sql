@@ -1,0 +1,12 @@
+-- Local-dev Postgres bootstrap. Runs once when the data volume is first created.
+-- Drop the volume (`docker compose down -v`) and restart to rerun.
+--
+-- Single database `onified_beta_local` matches the application-local.yml
+-- configuration of every service. Per-service isolation is achieved via
+-- per-service Postgres schemas (see 02-schemas.sql), not separate databases.
+--
+-- When you want real data, pg_restore the beta backup INTO this same database:
+--   docker exec -i onified-postgres pg_restore -U postgres -d onified_beta_local < beta-backup.dump
+
+-- The `onified_beta_local` database itself is created by POSTGRES_DB env var
+-- in docker-compose.local.yml — this script runs *inside* that DB.

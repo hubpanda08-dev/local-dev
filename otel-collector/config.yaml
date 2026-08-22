@@ -1,0 +1,40 @@
+# OpenTelemetry Collector config for local Onified development.
+# Receives OTLP from the logging SDK (enable with LOGGING_SDK_OTEL_ENABLED=true and
+# OTEL_COLLECTOR_ENDPOINT=http://localhost:4317), batches it, logs it for inspection,
+# and re-exports metrics on :8889 for Prometheus to scrape.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch: {}
+
+exporters:
+  debug:
+    verbosity: normal
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    resource_to_telemetry_conversion:
+      enabled: true
+
+service:
+  telemetry:
+    metrics:
+      address: 0.0.0.0:8888
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug, prometheus]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]

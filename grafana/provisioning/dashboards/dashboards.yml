@@ -1,0 +1,15 @@
+# Auto-provision dashboards from JSON files mounted at /var/lib/grafana/dashboards.
+apiVersion: 1
+
+providers:
+  - name: onified
+    orgId: 1
+    folder: Onified
+    type: file
+    disableDeletion: false
+    editable: true
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

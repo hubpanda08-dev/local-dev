@@ -1,0 +1,15 @@
+# Auto-provisioned Grafana datasources for local development.
+# Grafana picks this up on boot (deployment/docker-compose.local.yml mounts
+# ./grafana/provisioning into /etc/grafana/provisioning).
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: onf-prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
+    jsonData:
+      timeInterval: 15s

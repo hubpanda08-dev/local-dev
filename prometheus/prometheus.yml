@@ -1,0 +1,47 @@
+# Prometheus scrape config for local Onified development.
+# Brought up by deployment/docker-compose.local.yml (service: prometheus, :9090).
+#
+# Onified Spring Boot services run on the HOST (./gradlew :…:bootRun), so Prometheus
+# (in-container) reaches them via host.docker.internal. Each service exposes
+# /actuator/prometheus; note the path is prefixed by the service's context-path.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    env: local
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # OpenTelemetry Collector: its own telemetry (:8888) + app-exported metrics (:8889).
+  - job_name: otel-collector
+    static_configs:
+      - targets: ["otel-collector:8888", "otel-collector:8889"]
+
+  # Observability service — context-path /api/v1, default local port 8080.
+  - job_name: onified-observability
+    metrics_path: /api/v1/actuator/prometheus
+    static_configs:
+      - targets: ["host.docker.internal:8080"]
+        labels:
+          service: observability
+
+  # Add more services as you run them. Most use the default actuator path; a few
+  # set a context-path (then use /<context>/actuator/prometheus). Ports are in
+  # docs/BOOT_VALIDATION.md. Example:
+  #
+  # - job_name: onified-identity
+  #   metrics_path: /actuator/prometheus
+  #   static_configs:
+  #     - targets: ["host.docker.internal:8081"]
+  #       labels: { service: identity }

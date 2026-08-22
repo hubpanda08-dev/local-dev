@@ -1,0 +1,57 @@
+ Image onified/gateway:dev Building 
+ Image onified/cargo:dev Building 
+ Image onified/geo:dev Building 
+ Image onified/identity:dev Building 
+ Image onified/content:dev Building 
+ Image onified/platform-data:dev Building 
+ Image onified/billing-subscription:dev Building 
+ Image onified/master-data:dev Building 
+ Image onified/job-orchestration:dev Building 
+#1 [internal] load local bake definitions
+#1 reading from stdin 5.75kB done
+#1 DONE 0.0s
+
+#2 [platform-data internal] load build definition from Dockerfile.local-dev
+#2 transferring dockerfile: 2B 0.0s done
+#2 DONE 0.0s
+
+#3 [billing-subscription internal] load build definition from Dockerfile.local-dev
+#3 transferring dockerfile: 3.77kB 0.0s done
+#3 DONE 0.0s
+
+#4 [cargo internal] load build definition from Dockerfile.local-dev
+#4 transferring dockerfile: 3.30kB done
+#4 DONE 0.1s
+
+#5 [geo internal] load build definition from Dockerfile.local-dev
+#5 transferring dockerfile: 3.00kB done
+#5 DONE 0.1s
+
+#6 [identity internal] load build definition from Dockerfile.local-dev
+#6 transferring dockerfile: 3.41kB done
+#6 DONE 0.1s
+
+#7 [gateway internal] load build definition from Dockerfile.local-dev
+#7 transferring dockerfile: 3.06kB done
+#7 CANCELED
+
+#8 [job-orchestration internal] load build definition from Dockerfile.local-dev
+#8 transferring dockerfile: 3.75kB done
+#8 CANCELED
+
+#9 [content internal] load build definition from Dockerfile.local-dev
+#9 transferring dockerfile: 5.95kB done
+#9 CANCELED
+
+#10 [master-data internal] load build definition from Dockerfile.local-dev
+#10 transferring dockerfile: 3.24kB done
+#10 CANCELED
+
+#11 [billing-subscription] resolve image config for docker-image://docker.io/docker/dockerfile:1.7
+#11 CANCELED
+target platform-data: failed to solve: failed to read dockerfile: open Dockerfile.local-dev: no such file or directory
+
+
+
+View build details: docker-desktop://dashboard/build/default/default/xvtrb63e4tcu613klg1br550d
+

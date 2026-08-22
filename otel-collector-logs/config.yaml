@@ -1,0 +1,270 @@
+# OTel Collector config — consumes all 19 java-logging-sdk Kafka log topics and
+# writes each into its own OpenSearch index. Adapted from
+# observability/observability/otel/otel-collector-config.yaml with the awss3
+# exporters dropped (no AWS creds locally) — everything else is unchanged.
+# Topic names must match com.onified.logging.config.LoggingConfig's defaults.
+receivers:
+  kafka/audit:
+    brokers: [kafka:29092]
+    topic: audit_logs
+    group_id: otel-collector-audit
+    encoding: json
+  kafka/security:
+    brokers: [kafka:29092]
+    topic: security_logs
+    group_id: otel-collector-security
+    encoding: json
+  kafka/ai:
+    brokers: [kafka:29092]
+    topic: ai_logs
+    group_id: otel-collector-ai
+    encoding: json
+  kafka/security_authentication:
+    brokers: [kafka:29092]
+    topic: security_authentication_logs
+    group_id: otel-collector-authn
+    encoding: json
+  kafka/security_authorization:
+    brokers: [kafka:29092]
+    topic: security_authorization_logs
+    group_id: otel-collector-authz
+    encoding: json
+  kafka/security_access:
+    brokers: [kafka:29092]
+    topic: security_access_logs
+    group_id: otel-collector-access
+    encoding: json
+  kafka/network:
+    brokers: [kafka:29092]
+    topic: platform_network_logs
+    group_id: otel-collector-network
+    encoding: json
+  kafka/gateway:
+    brokers: [kafka:29092]
+    topic: platform_gateway_logs
+    group_id: otel-collector-gateway
+    encoding: json
+  kafka/app_service:
+    brokers: [kafka:29092]
+    topic: platform_app_service_logs
+    group_id: otel-collector-appsvc
+    encoding: json
+  kafka/workflow_execution:
+    brokers: [kafka:29092]
+    topic: workflow_execution_logs
+    group_id: otel-collector-workflow
+    encoding: json
+  kafka/integration_outbound:
+    brokers: [kafka:29092]
+    topic: integration_outbound_logs
+    group_id: otel-collector-integration
+    encoding: json
+  kafka/ai_interaction:
+    brokers: [kafka:29092]
+    topic: ai_interaction_logs
+    group_id: otel-collector-ai-interaction
+    encoding: json
+  kafka/ai_prompt:
+    brokers: [kafka:29092]
+    topic: ai_prompt_logs
+    group_id: otel-collector-ai-prompt
+    encoding: json
+  kafka/ai_completion:
+    brokers: [kafka:29092]
+    topic: ai_completion_logs
+    group_id: otel-collector-ai-completion
+    encoding: json
+  kafka/ai_retrieval:
+    brokers: [kafka:29092]
+    topic: ai_retrieval_logs
+    group_id: otel-collector-ai-retrieval
+    encoding: json
+  kafka/ai_safety_incident:
+    brokers: [kafka:29092]
+    topic: ai_safety_incident_logs
+    group_id: otel-collector-ai-safety
+    encoding: json
+  kafka/ai_kill_switch:
+    brokers: [kafka:29092]
+    topic: ai_kill_switch_logs
+    group_id: otel-collector-ai-killswitch
+    encoding: json
+  kafka/ai_cost_tracking:
+    brokers: [kafka:29092]
+    topic: ai_cost_tracking_logs
+    group_id: otel-collector-ai-cost
+    encoding: json
+  kafka/ledger_batch:
+    brokers: [kafka:29092]
+    topic: ledger_batch_logs
+    group_id: otel-collector-ledger
+    encoding: json
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 512
+  resource:
+    attributes:
+      - key: environment
+        from_attribute: environment
+        action: upsert
+      - key: service.name
+        from_attribute: service
+        action: upsert
+      - key: tenant.id
+        from_attribute: tenant_key
+        action: upsert
+      - key: app.id
+        from_attribute: app_id
+        action: upsert
+      - key: trace.id
+        from_attribute: trace_id
+        action: upsert
+
+exporters:
+  debug:
+    verbosity: detailed
+  opensearch/audit:
+    http: { endpoint: http://opensearch:9200 }
+    logs_index: otel-logs-audit
+  opensearch/security:
+    http: { endpoint: http://opensearch:9200 }
+    logs_index: otel-logs-security
+  opensearch/ai:
+    http: { endpoint: http://opensearch:9200 }
+    logs_index: otel-logs-ai
+  opensearch/security_authentication:
+    http: { endpoint: http://opensearch:9200 }
+    logs_index: otel-logs-security_authentication
+  opensearch/security_authorization:
+    http: { endpoint: http://opensearch:9200 }
+    logs_index: otel-logs-security_authorization
+  opensearch/security_access:
+    http: { endpoint: http://opensearch:9200 }
+    logs_index: otel-logs-security_access
+  opensearch/network:
+    http: { endpoint: http://opensearch:9200 }
+    logs_index: otel-logs-network
+  opensearch/gateway:
+    http: { endpoint: http://opensearch:9200 }
+    logs_index: otel-logs-gateway
+  opensearch/app_service:
+    http: { endpoint: http://opensearch:9200 }
+    logs_index: otel-logs-app_service
+  opensearch/workflow_execution:
+    http: { endpoint: http://opensearch:9200 }
+    logs_index: otel-logs-workflow_execution
+  opensearch/integration_outbound:
+    http: { endpoint: http://opensearch:9200 }
+    logs_index: otel-logs-integration_outbound
+  opensearch/ai_interaction:
+    http: { endpoint: http://opensearch:9200 }
+    logs_index: otel-logs-ai_interaction
+  opensearch/ai_prompt:
+    http: { endpoint: http://opensearch:9200 }
+    logs_index: otel-logs-ai_prompt
+  opensearch/ai_completion:
+    http: { endpoint: http://opensearch:9200 }
+    logs_index: otel-logs-ai_completion
+  opensearch/ai_retrieval:
+    http: { endpoint: http://opensearch:9200 }
+    logs_index: otel-logs-ai_retrieval
+  opensearch/ai_safety_incident:
+    http: { endpoint: http://opensearch:9200 }
+    logs_index: otel-logs-ai_safety_incident
+  opensearch/ai_kill_switch:
+    http: { endpoint: http://opensearch:9200 }
+    logs_index: otel-logs-ai_kill_switch
+  opensearch/ai_cost_tracking:
+    http: { endpoint: http://opensearch:9200 }
+    logs_index: otel-logs-ai_cost_tracking
+  opensearch/ledger_batch:
+    http: { endpoint: http://opensearch:9200 }
+    logs_index: otel-logs-ledger_batch
+
+service:
+  telemetry:
+    metrics:
+      level: detailed
+      address: 0.0.0.0:8888
+  pipelines:
+    logs/audit:
+      receivers: [kafka/audit]
+      processors: [resource, batch, memory_limiter]
+      exporters: [opensearch/audit, debug]
+    logs/security:
+      receivers: [kafka/security]
+      processors: [resource, batch, memory_limiter]
+      exporters: [opensearch/security, debug]
+    logs/ai:
+      receivers: [kafka/ai]
+      processors: [resource, batch, memory_limiter]
+      exporters: [opensearch/ai, debug]
+    logs/security_authentication:
+      receivers: [kafka/security_authentication]
+      processors: [resource, batch, memory_limiter]
+      exporters: [opensearch/security_authentication, debug]
+    logs/security_authorization:
+      receivers: [kafka/security_authorization]
+      processors: [resource, batch, memory_limiter]
+      exporters: [opensearch/security_authorization, debug]
+    logs/security_access:
+      receivers: [kafka/security_access]
+      processors: [resource, batch, memory_limiter]
+      exporters: [opensearch/security_access, debug]
+    logs/network:
+      receivers: [kafka/network]
+      processors: [resource, batch, memory_limiter]
+      exporters: [opensearch/network, debug]
+    logs/gateway:
+      receivers: [kafka/gateway]
+      processors: [resource, batch, memory_limiter]
+      exporters: [opensearch/gateway, debug]
+    logs/app_service:
+      receivers: [kafka/app_service]
+      processors: [resource, batch, memory_limiter]
+      exporters: [opensearch/app_service, debug]
+    logs/workflow_execution:
+      receivers: [kafka/workflow_execution]
+      processors: [resource, batch, memory_limiter]
+      exporters: [opensearch/workflow_execution, debug]
+    logs/integration_outbound:
+      receivers: [kafka/integration_outbound]
+      processors: [resource, batch, memory_limiter]
+      exporters: [opensearch/integration_outbound, debug]
+    logs/ai_interaction:
+      receivers: [kafka/ai_interaction]
+      processors: [resource, batch, memory_limiter]
+      exporters: [opensearch/ai_interaction, debug]
+    logs/ai_prompt:
+      receivers: [kafka/ai_prompt]
+      processors: [resource, batch, memory_limiter]
+      exporters: [opensearch/ai_prompt, debug]
+    logs/ai_completion:
+      receivers: [kafka/ai_completion]
+      processors: [resource, batch, memory_limiter]
+      exporters: [opensearch/ai_completion, debug]
+    logs/ai_retrieval:
+      receivers: [kafka/ai_retrieval]
+      processors: [resource, batch, memory_limiter]
+      exporters: [opensearch/ai_retrieval, debug]
+    logs/ai_safety_incident:
+      receivers: [kafka/ai_safety_incident]
+      processors: [resource, batch, memory_limiter]
+      exporters: [opensearch/ai_safety_incident, debug]
+    logs/ai_kill_switch:
+      receivers: [kafka/ai_kill_switch]
+      processors: [resource, batch, memory_limiter]
+      exporters: [opensearch/ai_kill_switch, debug]
+    logs/ai_cost_tracking:
+      receivers: [kafka/ai_cost_tracking]
+      processors: [resource, batch, memory_limiter]
+      exporters: [opensearch/ai_cost_tracking, debug]
+    logs/ledger_batch:
+      receivers: [kafka/ledger_batch]
+      processors: [resource, batch, memory_limiter]
+      exporters: [opensearch/ledger_batch, debug]

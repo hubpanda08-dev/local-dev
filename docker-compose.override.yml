@@ -1,0 +1,83 @@
+# =============================================================================
+# Overlay — build each service image from its HOST-built bootJar using that
+# service's own Dockerfile.local-dev-jar, instead of the in-container
+# multi-stage Dockerfile.local-dev.
+#
+# Why: the per-service Dockerfile.local-dev builds inside the container and
+# needs the onified shared libraries on the classpath (resolved from GitLab
+# Maven, which needs credentials). Dockerfile.local-dev-jar just copies a jar
+# already built on the host, where Gradle resolved those libraries from the
+# local Maven repo (~/.m2) — no credentials required.
+#
+# Prerequisite — build the jar(s) on host first, no staging step needed:
+#   ./gradlew :services:platform:<svc>:bootJar -x test -Ponified.useInRepoLibraries=false
+#
+# Usage — named docker-compose.override.yml so Compose auto-merges it with
+# docker-compose.yml, no -f flag needed:
+#   cd local-dev && docker compose build <svc> && docker compose up -d <svc>
+#
+# Not covered here (their Dockerfile.local-dev doesn't exist on disk to base
+# a jar-only variant on): platform-data, master-data, external-internal-internal-gateway, cargo.
+# =============================================================================
+
+services:
+
+  internal-gateway:
+    build:
+      context: ..
+      dockerfile: services/platform/internal-gateway/Dockerfile.local-dev-jar
+
+  iam:
+    build:
+      context: ..
+      dockerfile: services/platform/iam/Dockerfile.local-dev-jar
+
+  content:
+    build:
+      context: ..
+      dockerfile: services/platform/content/Dockerfile.local-dev-jar
+
+  analytics:
+    build:
+      context: ..
+      dockerfile: services/platform/analytics/Dockerfile.local-dev-jar
+
+  billing-subscription:
+    build:
+      context: ..
+      dockerfile: services/platform/billing-subscription/Dockerfile.local-dev-jar
+
+  governance:
+    build:
+      context: ..
+      dockerfile: services/platform/governance/Dockerfile.local-dev-jar
+
+  notification:
+    build:
+      context: ..
+      dockerfile: services/platform/notification/Dockerfile.local-dev-jar
+
+  integration:
+    build:
+      context: ..
+      dockerfile: services/platform/integration/Dockerfile.local-dev-jar
+
+  job-orchestration:
+    build:
+      context: ..
+      dockerfile: services/platform/job-orchestration/Dockerfile.local-dev-jar
+
+  work-management:
+    build:
+      context: ..
+      dockerfile: services/platform/work-management/Dockerfile.local-dev-jar
+
+  workflow:
+    build:
+      context: ..
+      dockerfile: services/platform/workflow/Dockerfile.local-dev-jar
+
+  geo:
+    build:
+      context: ..
+      dockerfile: services/platform/geo/Dockerfile.local-dev-jar

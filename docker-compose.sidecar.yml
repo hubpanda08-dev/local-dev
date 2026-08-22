@@ -1,0 +1,47 @@
+services:
+  # Named "sidecar-*" (not "secret-proxy"/"redis") — this file is now folded
+  # into the main docker-compose.yml via `include:` alongside
+  # docker-compose.secret-proxy.yml and the main compose's own "redis", both
+  # of which already use those exact service names for a DIFFERENT proxy
+  # (main vault:8200, used by master-data). `include:` merges services by
+  # name, so keeping the old names here would have silently replaced the
+  # working main secret-proxy/redis with these instead.
+  sidecar-secret-proxy:
+    # v2 supports RS256 (v1/"latest" was HS256-only) — verified 2026-08-01 against
+    # the main secret-proxy overlay; same config applies here. v2 expects a
+    # per-tenant Vault mount named "{tenantKey}-kv" (e.g. "localtest-kv"), not the
+    # single shared "kv" mount seeded today — reseed under that name per tenant.
+    image: vdtj/secret-proxy:v2
+    container_name: onified-sidecar-secret-proxy
+    ports:
+      - "9200:8200"
+      - "9201:8201"
+    environment:
+      VAULT_ADDR: http://vault2:9100
+      VAULT_TOKEN: root
+      VAULT_TLS_VERIFY: "false"
+      REDIS_ADDR: sidecar-redis:6379
+      REDIS_ENABLED: "true"
+      JWT_CLAIM: tenantKey
+      JWT_ALGORITHM: RS256
+      # v2 needs the FULL PEM (headers + newlines) — unlike rbac-library's
+      # ONIFIED_RBAC_RS256_TRUSTED_PUBLIC_KEYS elsewhere, which takes bare base64.
+      ONIFIED_GATEWAY_JWT_PUBLIC_KEY: "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2bKXEiiD+/qZrfMRJUGV\nsnj/5mBLr+gdJZpmVJ4XqDaYx7i59V9EMWN+DvzAa08QaCgGbfGTQCVI6Kxjl1cr\n7GPPIp0XzmZJ6vAbnkXZBEiyfwDXo7a4EnOGzi0B493zyYru/CNbdMvS4LjNmkrU\nxb32zbVHhX4Zn51Ml0Uivk36sBIyamNAAIrPzG3LgdR1qbZzqc+fWDnuAEIzYhC+\nEmIGimC+eOgM4NztK9U/7fqaF0VDgxXq1R4srx4pimp3AabdiwkNdYEslOc7gY+3\nz5+XAKfakP7yrWP6n5hdceV53fwCakF9gLq8u9adfBkZfgMQU285dhvBMWz0zgcw\nkwIDAQAB\n-----END PUBLIC KEY-----\n"
+      ONIFIED_IDENTITY_JWT_PUBLIC_KEY: "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2bKXEiiD+/qZrfMRJUGV\nsnj/5mBLr+gdJZpmVJ4XqDaYx7i59V9EMWN+DvzAa08QaCgGbfGTQCVI6Kxjl1cr\n7GPPIp0XzmZJ6vAbnkXZBEiyfwDXo7a4EnOGzi0B493zyYru/CNbdMvS4LjNmkrU\nxb32zbVHhX4Zn51Ml0Uivk36sBIyamNAAIrPzG3LgdR1qbZzqc+fWDnuAEIzYhC+\nEmIGimC+eOgM4NztK9U/7fqaF0VDgxXq1R4srx4pimp3AabdiwkNdYEslOc7gY+3\nz5+XAKfakP7yrWP6n5hdceV53fwCakF9gLq8u9adfBkZfgMQU285dhvBMWz0zgcw\nkwIDAQAB\n-----END PUBLIC KEY-----\n"
+    depends_on:
+      - sidecar-redis
+      - vault2-seed
+    networks:
+      - file-storage-net
+
+  sidecar-redis:
+    image: redis:7-alpine
+    container_name: onified-sidecar-redis
+    ports:
+      - "6380:6379"
+    networks:
+      - file-storage-net
+
+networks:
+  file-storage-net:
+    name: file-storage-net

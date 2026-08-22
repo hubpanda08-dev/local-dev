@@ -1,0 +1,109 @@
+services:
+  vault2:
+    image: hashicorp/vault:latest
+    container_name: vault2
+    ports:
+      - "9100:9100"
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: root
+      VAULT_DEV_LISTEN_ADDRESS: "0.0.0.0:9100"
+    cap_add:
+      - IPC_LOCK
+    command: server -dev
+    networks:
+      - file-storage-net
+
+  # vault2 runs in -dev mode (in-memory backend) — every secret seeded into it is
+  # lost on restart, unlike the main vault-seed job (docker-compose.local.yml)
+  # which was the only one automated. This is the sidecar-stack equivalent,
+  # previously done by hand each time vault2/secret-proxy restarted (per the
+  # comments in docker-compose.sidecar.yml / docker-compose.secret-proxy.yml
+  # about re-seeding under the "{tenantKey}-kv" mount).
+  #
+  # secret-proxy:v2 always routes to a mount named "{tenantKey}-kv", substituting
+  # it for whatever's before the first "/" in the caller's configured secret-path
+  # — confirmed against master-data's working setup: VAULT_SECRET_PATH=
+  # "kv/master-data-service/db_cred" resolves through the proxy to
+  # "localtest-kv/master-data-service/db_cred", i.e. the "kv" segment is discarded
+  # and replaced with the tenant mount, everything after it is kept as-is. Cargo
+  # has no such override (vault-tenant.context.secret-path defaults to
+  # "kv/db_cred"), so its effective path is "localtest-kv/db_cred".
+  vault2-seed:
+    image: hashicorp/vault:1.16
+    container_name: onified-vault2-seed
+    restart: "no"
+    depends_on:
+      vault2:
+        condition: service_started
+    environment:
+      VAULT_ADDR: http://vault2:9100
+      VAULT_TOKEN: root
+      # Same dev-only DB used by every other service this session (postgres
+      # container, onified_beta_local database) — cargo gets its own "app_cargo"
+      # schema within it via vault-tenant.schema.schema-name, not a separate DB.
+      # "postgresql://postgres" (not bare "postgres"): vault-tenant-proxy-client
+      # 1.3.1's ProxySecretData.toJdbcUrl() builds "jdbc:" + host with no driver
+      # scheme inserted — same workaround as the main vault-seed job.
+      CARGO_DB_HOST: postgresql://postgres
+      CARGO_DB_PORT: "5432"
+      CARGO_DB_NAME: onified_beta_local
+      CARGO_DB_USERNAME: postgres
+      CARGO_DB_PASSWORD: Thekapilg
+      # One Vault mount is created per tenantKey listed here, because
+      # secret-proxy:v2 derives the mount name as "{tenantKey}-kv" from the
+      # caller's JWT claim — a tenant with no matching mount fails every
+      # tenant-scoped query. Seeding only "localtest" (the original behaviour)
+      # meant no real tenant in the restored DB could be used: iam.tenant_accounts
+      # holds beta / acme / betashared. Keep this list in sync with the tenant
+      # keys you actually log in as. Space-separated.
+      SEED_TENANT_KEYS: "localtest beta acme betashared"
+      # OpenSearch credentials for cargo's per-tenant search client
+      # (CargoTenantOpenSearchClientFactory, active when cargo.es-sync.enabled=true).
+      # It calls SecretProxyClient#fetchOpenSearchCredentials, which GETs
+      # "{proxy}/v1/{secret-path}" and parses ProxyOpenSearchSecretData — whose
+      # canonical JSON keys are lowercase "url" and "api_key" (uppercase
+      # OPENSEARCH_URL/OPENSEARCH_API_KEY are accepted as legacy aliases). Field
+      # names must match exactly or the client builds with nulls.
+      #
+      # The URL is the in-network hostname: docker-compose.opensearch.yml declares
+      # no `networks:` key, so opensearch sits on the compose default network, the
+      # same one cargo is on. NOT the 9210 host mapping — that is host-side only.
+      #
+      # The api-key is sent verbatim as the Authorization header value (see
+      # constructOpenSearchClient). The local cluster runs with
+      # DISABLE_SECURITY_PLUGIN so the value is ignored, but it must be non-blank:
+      # a null would be passed straight into BasicHeader. admin:admin is
+      # OpenSearch's own dev default and is dev-only, like every other credential
+      # in this file.
+      CARGO_OS_URL: http://opensearch:9200
+      CARGO_OS_API_KEY: "Basic YWRtaW46YWRtaW4="
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        until vault status >/dev/null 2>&1; do sleep 1; done
+        for T in $$SEED_TENANT_KEYS; do
+          vault secrets enable -path=$$T-kv -version=2 kv 2>/dev/null || true
+          vault kv put $$T-kv/db_cred \
+            host="$$CARGO_DB_HOST" \
+            port="$$CARGO_DB_PORT" \
+            db_name="$$CARGO_DB_NAME" \
+            username="$$CARGO_DB_USERNAME" \
+            password="$$CARGO_DB_PASSWORD"
+          echo "vault2-seed: seeded $$T-kv/db_cred"
+          # Same mount, second key. Cargo's effective path is
+          # "kv/opensearch-creds" (cargo.es-sync.opensearch-secret-path in
+          # application-local.yml), which secret-proxy:v2 rewrites to
+          # "$$T-kv/opensearch-creds" by the same first-segment substitution
+          # documented above for db_cred.
+          vault kv put $$T-kv/opensearch-creds \
+            url="$$CARGO_OS_URL" \
+            api_key="$$CARGO_OS_API_KEY"
+          echo "vault2-seed: seeded $$T-kv/opensearch-creds"
+        done
+        echo "vault2-seed: done"
+    networks:
+      - file-storage-net
+
+networks:
+  file-storage-net:
+    name: file-storage-net

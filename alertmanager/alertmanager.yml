@@ -1,0 +1,13 @@
+# Minimal Alertmanager config for local development.
+# Routes everything to a no-op receiver so Prometheus has a valid alerting target
+# without sending real notifications. Replace `devnull` with email/Slack/webhook
+# receivers to test alert delivery locally.
+route:
+  receiver: devnull
+  group_by: ["alertname"]
+  group_wait: 10s
+  group_interval: 1m
+  repeat_interval: 1h
+
+receivers:
+  - name: devnull

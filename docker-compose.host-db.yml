@@ -1,0 +1,143 @@
+# =============================================================================
+# Optional overlay — point every service at the HOST Postgres (your restored
+# beta backup) instead of the containerized Postgres.
+#
+# When NOT to use this:
+#   You want fresh empty schemas. The main docker-compose.yml already targets
+#   the containerized Postgres with the right schemas
+#   pre-created (see postgres-init/02-schemas.sql) — just `docker compose up`.
+#
+# When TO use this:
+#   You want services to see the DATA from your locally-restored beta backup.
+#   The main compose's containerized Postgres starts empty; this overlay
+#   redirects every service to your host Postgres on :5432 instead.
+#
+# Prerequisite:
+#   Host Postgres on :5432 with the `onified` database, user `postgres`,
+#   password `Thekapilg`. (Matches application-local.yml across services.)
+#
+# Usage:
+#   docker compose \
+#     -f deployment/docker-compose.yml \
+#     -f deployment/docker-compose.host-db.yml \
+#     up -d --scale postgres=0
+#
+# `--scale postgres=0` prevents the containerized Postgres from starting (the
+# host serves that role; otherwise both would fight over :5432 on the host).
+#
+# On Linux: `host.docker.internal` doesn't resolve by default. Either set
+# HOST_DB_HOST=<your-host-ip> in your shell, or this overlay's `extra_hosts`
+# directive maps `host.docker.internal:host-gateway` on each service so it
+# resolves to the host bridge.
+#
+# This overlay only swaps the DB host. URL/schema/credentials/everything else
+# come from the main compose (already correct).
+# =============================================================================
+
+x-host-db: &host-db-env
+  # Override the SPRING_DATASOURCE_URL to point at host.docker.internal.
+  # The schema is service-specific so each service block below sets its own URL.
+  SPRING_DATASOURCE_USERNAME: "postgres"
+  SPRING_DATASOURCE_PASSWORD: "Thekapilg"
+  DB_HOST: "${HOST_DB_HOST:-host.docker.internal}"
+
+x-host-extra-hosts: &host-extra-hosts
+  - "host.docker.internal:host-gateway"
+
+services:
+
+  gateway:
+    environment:
+      <<: *host-db-env
+      SPRING_DATASOURCE_URL: "jdbc:postgresql://${HOST_DB_HOST:-host.docker.internal}:5432/onified?currentSchema=platform_gateway_service"
+    extra_hosts: *host-extra-hosts
+
+  identity:
+    environment:
+      <<: *host-db-env
+      SPRING_DATASOURCE_URL: "jdbc:postgresql://${HOST_DB_HOST:-host.docker.internal}:5432/onified?currentSchema=platform_rbac_service"
+    extra_hosts: *host-extra-hosts
+
+  sso:
+    environment:
+      <<: *host-db-env
+      SPRING_DATASOURCE_URL: "jdbc:postgresql://${HOST_DB_HOST:-host.docker.internal}:5432/onified?currentSchema=platform_rbac_service"
+    extra_hosts: *host-extra-hosts
+
+  content:
+    environment:
+      <<: *host-db-env
+      SPRING_DATASOURCE_URL: "jdbc:postgresql://${HOST_DB_HOST:-host.docker.internal}:5432/onified?currentSchema=platform_content"
+    extra_hosts: *host-extra-hosts
+
+  platform-data:
+    environment:
+      <<: *host-db-env
+      SPRING_DATASOURCE_URL: "jdbc:postgresql://${HOST_DB_HOST:-host.docker.internal}:5432/onified?currentSchema=data_platform_service"
+    extra_hosts: *host-extra-hosts
+
+  master-data:
+    environment:
+      <<: *host-db-env
+      SPRING_DATASOURCE_URL: "jdbc:postgresql://${HOST_DB_HOST:-host.docker.internal}:5432/onified"
+    extra_hosts: *host-extra-hosts
+
+  analytics:
+    environment:
+      <<: *host-db-env
+      SPRING_DATASOURCE_URL: "jdbc:postgresql://${HOST_DB_HOST:-host.docker.internal}:5432/onified?currentSchema=platform_analytics"
+    extra_hosts: *host-extra-hosts
+
+  billing-subscription:
+    environment:
+      <<: *host-db-env
+      SPRING_DATASOURCE_URL: "jdbc:postgresql://${HOST_DB_HOST:-host.docker.internal}:5432/onified?currentSchema=platform_billing_service"
+    extra_hosts: *host-extra-hosts
+
+  governance:
+    environment:
+      <<: *host-db-env
+      SPRING_DATASOURCE_URL: "jdbc:postgresql://${HOST_DB_HOST:-host.docker.internal}:5432/onified?currentSchema=platform_governance_service"
+    extra_hosts: *host-extra-hosts
+
+  notification:
+    environment:
+      <<: *host-db-env
+      SPRING_DATASOURCE_URL: "jdbc:postgresql://${HOST_DB_HOST:-host.docker.internal}:5432/onified?currentSchema=platform_notification_service"
+    extra_hosts: *host-extra-hosts
+
+  integration:
+    environment:
+      <<: *host-db-env
+      SPRING_DATASOURCE_URL: "jdbc:postgresql://${HOST_DB_HOST:-host.docker.internal}:5432/onified?currentSchema=platform_integration_service"
+    extra_hosts: *host-extra-hosts
+
+  job-orchestration:
+    environment:
+      <<: *host-db-env
+      SPRING_DATASOURCE_URL: "jdbc:postgresql://${HOST_DB_HOST:-host.docker.internal}:5432/onified?currentSchema=platform_job_orchestration"
+    extra_hosts: *host-extra-hosts
+
+  work-management:
+    environment:
+      <<: *host-db-env
+      SPRING_DATASOURCE_URL: "jdbc:postgresql://${HOST_DB_HOST:-host.docker.internal}:5432/onified?currentSchema=platform_work_management"
+    extra_hosts: *host-extra-hosts
+
+  workflow:
+    environment:
+      <<: *host-db-env
+      SPRING_DATASOURCE_URL: "jdbc:postgresql://${HOST_DB_HOST:-host.docker.internal}:5432/onified?currentSchema=platform_workflow_service"
+    extra_hosts: *host-extra-hosts
+
+  geo:
+    environment:
+      <<: *host-db-env
+      SPRING_DATASOURCE_URL: "jdbc:postgresql://${HOST_DB_HOST:-host.docker.internal}:5432/onified?currentSchema=platform_geo"
+    extra_hosts: *host-extra-hosts
+
+  cargo:
+    environment:
+      <<: *host-db-env
+      SPRING_DATASOURCE_URL: "jdbc:postgresql://${HOST_DB_HOST:-host.docker.internal}:5432/onified"
+    extra_hosts: *host-extra-hosts
