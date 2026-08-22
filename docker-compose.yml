@@ -374,6 +374,13 @@ services:
       # ── Logging SDK ───────────────────────────────────────────────────────
       LOGGING_SDK_BOOTSTRAP_SERVERS: kafka:29092
       LOGGING_SDK_OTEL_ENABLED: "false"
+      # iam's cached logging-starter jar is 2026.9.3-SNAPSHOT (other services here already
+      # resolved 2026.9.4-SNAPSHOT) — in 9.3 the real loggingClient bean's Kafka producer always
+      # gets an empty bootstrap.servers regardless of LOGGING_SDK_BOOTSTRAP_SERVERS, crash-looping
+      # iam on every boot ("No resolvable bootstrap urls given in bootstrap.servers"). dev-preview
+      # mode swaps in DevPreviewLogSink (no Kafka producer at all) — the SDK's own supported
+      # local-dev bypass for exactly this, not a workaround we invented.
+      LOGGING_SDK_DEV_PREVIEW: "true"
       # ── Auth + crypto secrets (DEV ONLY) ──────────────────────────────────
       ONIFIED_JWT_SECRET_KEY: "ZGV2LW9ubHktc2VjcmV0LW5vdC1mb3ItcHJvZC1kby1ub3QtdXNlLTMyYnl0ZXM="
       ONIFIED_RBAC_TOKEN_SECRET: "ZGV2LXJiYWMtdG9rZW4tc2VjcmV0LTMyLWJ5dGVzISE="
@@ -1788,6 +1795,17 @@ services:
       ONIFIED_RBAC_PUBLIC_PATHS_PATTERNS: "/swagger-ui/**,/cargo-service/swagger-ui/**,/v3/api-docs/**,/cargo-service/v3/api-docs/**,/swagger-ui.html,/cargo-service/swagger-ui.html,/actuator/**,/cargo-service/actuator/**,/public/v1/trip/**,/internal/v1/**"
       # ── L4 tenant-host binding ────────────────────────────────────────────
       ONIFIED_RBAC_TENANT_HOST_BINDING_ENFORCE: "false"
+      # ── Service identity (CrossTenantExecutor: own-tenant + partner-tenant DB-credential
+      # tokens for RFQ/award/own-truck flows) — every tenant switch calls iam's legacy
+      # /internal/v1/service-auth/token-for-(own-)tenant path, which auto-provisions this
+      # UserAccounts row on first use (findOrCreateServiceUser) and just needs a REAL role
+      # publicId. "CARGO_SERVICE" (rol_4e3b51f400f0410eb9f9536fa4affb6c) already exists in the
+      # restored beta dump, platform-scoped (tenant_id NULL) so it resolves for any tenant.
+      # Without these, every CrossTenantExecutor call gets rawJwt=null -> "rawJwt required".
+      ONIFIED_RBAC_SERVICE_IDENTITY_ENABLED: "true"
+      ONIFIED_RBAC_SERVICE_IDENTITY_USERNAME: "svc_cargo_service"
+      ONIFIED_RBAC_SERVICE_IDENTITY_PASSWORD: "dev-throwaway-password"
+      ONIFIED_RBAC_SERVICE_IDENTITY_ROLE_ID: "rol_4e3b51f400f0410eb9f9536fa4affb6c"
       # ── Heap override — minimized for a low-resource local run ────────────
       HEAP: "768m"
     depends_on:
