@@ -203,7 +203,15 @@ services:
       kafka:    { condition: service_healthy }
       redis:    { condition: service_healthy }
     ports:
-      - "8765:8765"
+      # Moved off 8765 — gateway-cors-proxy (nginx) now owns that port and
+      # sits in front of this container. See gateway-cors-proxy's own comment
+      # block (local-dev/nginx/gateway-cors-proxy.conf) for why: this
+      # service's own Access-Control-* headers don't survive proxied routes
+      # (Spring Cloud Gateway routing-filter behavior, unrelated to CORS
+      # config values), and beta/prod never notice because an Istio Envoy
+      # sidecar in front of them papers over it — local has no such sidecar.
+      # 18765 is kept for direct debugging (curl/Postman bypassing the proxy).
+      - "18765:8765"
     volumes:
       # ── Route-table override for the containerised stack ───────────────────
       # The in-jar application-local.yml hardcodes every route to

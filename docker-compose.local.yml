@@ -270,6 +270,23 @@ services:
     volumes:
       - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
 
+  # Local-dev-only stand-in for beta/prod's Istio/Envoy sidecar — internal-gateway's own
+  # CorsWebFilter doesn't survive Spring Cloud Gateway's routing filters on a PROXIED
+  # route (confirmed via curl + TRACE logs, and reproduced on beta.onified.ai itself);
+  # beta/prod never notice because Envoy in front of them papers over it. Full writeup in
+  # nginx/gateway-cors-proxy.conf. Treated as infra (not tied to internal-gateway's own
+  # start/stop) so it's always up whenever the stack is, regardless of which app service
+  # you bring up — internal-gateway itself now only publishes host port 18765 (see
+  # docker-compose.yml), this container owns 8765, the port the frontend actually calls.
+  gateway-cors-proxy:
+    image: nginx:1.27-alpine
+    container_name: onified-gateway-cors-proxy
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    volumes:
+      - ./nginx/gateway-cors-proxy.conf:/etc/nginx/conf.d/default.conf:ro
+
 volumes:
   # New name on purpose: the old `postgres-data` volume holds an orphaned PG17
   # data dir owned by uid 70 (from the pre-timescaledb `postgres` image), which
