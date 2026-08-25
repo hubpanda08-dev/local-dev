@@ -286,6 +286,16 @@ services:
       - "8765:8765"
     volumes:
       - ./nginx/gateway-cors-proxy.conf:/etc/nginx/conf.d/default.conf:ro
+    # internal-gateway (docker-compose.yml) depends_on this with condition: service_healthy —
+    # without a healthcheck that condition is unsatisfiable and `docker compose up` refuses the
+    # whole dependency chain. Port check only (not an HTTP status check): this proxy comes up
+    # independent of internal-gateway and legitimately 502s until that's ready — we only need
+    # to know nginx itself is listening.
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 8765 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
 volumes:
   # New name on purpose: the old `postgres-data` volume holds an orphaned PG17
