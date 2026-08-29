@@ -451,7 +451,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1.75g
+          memory: 2.5g
           cpus: '1.5'
         reservations:
           memory: 1g
@@ -656,8 +656,8 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1.25g
-          cpus: '1.0'
+          memory: 2g
+          cpus: '1.5'
         reservations:
           memory: 768m
           cpus: '0.25'
@@ -772,8 +772,8 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1.25g
-          cpus: '1.0'
+          memory: 2g
+          cpus: '1.5'
         reservations:
           memory: 768m
           cpus: '0.25'
@@ -1503,9 +1503,15 @@ services:
       LOGGING_SDK_OTEL_ENABLED: "false"
       # ── gRPC server (inbound) + s2s clients to iam/content/billing-subscription
       # (JwtTokenGrpcGateway, UserAvatarGrpcGateway, DocumentGrpcGateway, EntitlementGrpcGateway).
+      # Host/fqdn vars mirror the port vars below — application-local.yml reads both,
+      # so a compose service rename only needs a change here, not in the yml.
       GRPC_SERVER_PORT: "8506"
+      IDENTITY_GRPC_HOST: iam
+      IDENTITY_GRPC_FQDN: http://iam
       IDENTITY_GRPC_PORT: "8500"
+      CONTENT_GRPC_FQDN: http://content
       CONTENT_GRPC_PORT: "8501"
+      BILLING_GRPC_FQDN: http://billing-subscription
       BILLING_GRPC_PORT: "8503"
       # ── Auth secrets (DEV ONLY) ───────────────────────────────────────────
       ONIFIED_JWT_SECRET_KEY: "ZGV2LW9ubHktc2VjcmV0LW5vdC1mb3ItcHJvZC1kby1ub3QtdXNlLTMyYnl0ZXM="
@@ -1532,8 +1538,9 @@ services:
       # ── VisualVM / JMX (local dev only) ────────────────────────────────────
       JAVA_TOOL_OPTIONS: >-
         -Dcom.sun.management.jmxremote
-        -Dcom.sun.management.jmxremote.port=9092
-        -Dcom.sun.management.jmxremote.rmi.port=9092
+        -Dcom.sun.management.jmxremote.port=9091
+        -Dcom.sun.management.jmxremote.rmi.port=9091
+        -Dcom.sun.management.jmxremote.host=127.0.0.1
         -Dcom.sun.management.jmxremote.local.only=false
         -Dcom.sun.management.jmxremote.authenticate=false
         -Dcom.sun.management.jmxremote.ssl=false
@@ -1552,7 +1559,7 @@ services:
     ports:
       - "127.0.0.1:8092:8092"
       - "127.0.0.1:8506:8506"
-      - "127.0.0.1:9092:9092"
+      - "127.0.0.1:9091:9091"
     deploy:
       resources:
         limits:
@@ -1919,6 +1926,14 @@ services:
       # Not set at all before (cargo.integration/cargo.platform-data properties):
       CARGO_INTEGRATION_BASE_URL: http://integration:8090
       CARGO_PLATFORM_DATA_BASE_URL: http://platform-data:8085
+      # search-index-starter's FieldRegistryNameResolver (es-sync field-name resolution) binds
+      # onified.opensearch-sync.field-registry.base-url, whose placeholder is
+      # ${PLATFORM_DATA_SERVICE_URL:http://localhost:8085} — a DIFFERENT env var name than
+      # CARGO_PLATFORM_DATA_BASE_URL above (that one only feeds cargo.platform-data.base-url).
+      # Same dead-var-falls-back-to-localhost bug already diagnosed for "workflow" elsewhere in
+      # this file (see its PDS_SERVICE_URL comment) — confirmed live 2026-08-29: without this,
+      # cargo's OpenSearch field-name lookups silently target the cargo container itself.
+      PLATFORM_DATA_SERVICE_URL: http://platform-data:8085
       # cargo's vault-tenant-routing DataSource (same class of hard-wired
       # dependency as master-data) needs its own secret-proxy — but a
       # DIFFERENT instance from master-data's: the "sidecar" one
@@ -1965,6 +1980,15 @@ services:
       ONIFIED_RBAC_SERVICE_IDENTITY_USERNAME: "svc_cargo_service"
       ONIFIED_RBAC_SERVICE_IDENTITY_PASSWORD: "dev-throwaway-password"
       ONIFIED_RBAC_SERVICE_IDENTITY_ROLE_ID: "rol_4e3b51f400f0410eb9f9536fa4affb6c"
+      # grpc-support's OWN service-identity switch (onified.s2s.grpc.service-identity.enabled) —
+      # a separate property from the rbac one above, gating GrpcServiceTokenProvider /
+      # GrpcAuthClientInterceptor (grpc-support's S2SGrpcAutoConfiguration). It delegates to the
+      # SAME ServiceTokenSource the rbac property above already provisions, so no separate
+      # credentials are needed — but without this flag the interceptor bean never gets created,
+      # and every outbound @GrpcAuthenticated call (e.g. TenantPartnerRelationshipGrpcGateway)
+      # goes out with no Authorization metadata at all, rejected UNAUTHENTICATED "Missing bearer
+      # token". Confirmed live 2026-08-29.
+      ONIFIED_S2S_GRPC_SERVICE_IDENTITY_ENABLED: "true"
       # ── Heap override — minimized for a low-resource local run ────────────
       HEAP: "768m"
       # ── VisualVM / JMX (local dev only) ────────────────────────────────────
@@ -2000,8 +2024,8 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1.25g
-          cpus: '1.0'
+          memory: 2g
+          cpus: '1.5'
         reservations:
           memory: 768m
           cpus: '0.25'
